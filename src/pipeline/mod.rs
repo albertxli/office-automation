@@ -12,6 +12,7 @@ pub mod color_coder;
 pub mod delta_updater;
 pub mod linker;
 pub mod table_updater;
+pub mod verbose;
 
 use std::time::{Duration, Instant};
 
@@ -58,8 +59,8 @@ fn s_dim() -> Style { Style::new().dim() }
 /// Fixed width for step name + dot leaders (ensures count column aligns).
 const STEP_WIDTH: usize = 30;
 
-/// Format a completed step line:  `● Links ··················· 86   0.0s`
-fn format_step_line(name: &str, count: usize, secs: f64) -> String {
+/// Format a completed step line:  `• Links ··················· 86   0.0s`
+pub fn format_step_line_pub(name: &str, count: usize, secs: f64) -> String {
     let leader_len = STEP_WIDTH.saturating_sub(name.len() + 1);
     let leaders = "·".repeat(leader_len);
     format!(
@@ -71,6 +72,9 @@ fn format_step_line(name: &str, count: usize, secs: f64) -> String {
         s_dim().apply_to(format!("{secs:.1}s")),
     )
 }
+
+/// Public wrapper for update.rs to use for the Relink step.
+pub fn make_spinner_pub(step_name: &str) -> ProgressBar { make_spinner(step_name) }
 
 /// Create a spinner for a pipeline step.
 fn make_spinner(step_name: &str) -> ProgressBar {
@@ -102,7 +106,7 @@ macro_rules! run_step {
         let elapsed = t.elapsed().as_secs_f64();
         if let Some(pb) = spinner {
             pb.finish_and_clear();
-            println!("{}", format_step_line($name, count, elapsed));
+            println!("{}", format_step_line_pub($name, count, elapsed));
         }
         $results.steps.push(StepResult { name: $name, count, elapsed_secs: elapsed, ok: true });
     }};
@@ -118,7 +122,10 @@ pub fn run_pipeline(
     steps_include: &[String],
     steps_skip: &[String],
     quiet: bool,
+    verbose: bool,
 ) -> OaResult<PipelineResults> {
+    verbose::set_verbose(verbose);
+
     let active_steps = resolve_steps(steps_include, steps_skip)
         .map_err(|e| crate::error::OaError::Config(e))?;
 

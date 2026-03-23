@@ -73,6 +73,9 @@ pub fn relink_pptx_zip(pptx_path: &Path, new_excel_path: &Path) -> Result<usize,
                         writer.write_all(&modified_xml)
                             .map_err(|e| format!("Failed to write {name}: {e}"))?;
                         total_rewritten += count;
+                        crate::pipeline::verbose::note(
+                            &format!("{:<42} {} links", name, count)
+                        );
                     } else {
                         // No changes — write original
                         writer.start_file(&name, options)

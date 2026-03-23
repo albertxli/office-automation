@@ -80,7 +80,19 @@ pub fn update_tables(
             config,
             excel_app,
         ) {
-            Ok(true) => count += 1,
+            Ok(true) => {
+                count += 1;
+                let ttype = match table_info.table_type {
+                    TableType::Normal => "ntbl",
+                    TableType::Heatmap => "htmp",
+                    TableType::Transposed => "trns",
+                };
+                super::verbose::detail(
+                    ole_ref.slide_index,
+                    &table_info.name,
+                    &format!("{ttype} · {}!{}", parts.sheet_name, parts.range_address),
+                );
+            }
             Ok(false) => {} // Skipped
             Err(e) => {
                 eprintln!("Warning: failed to update table for '{}': {e}", ole_ref.name);

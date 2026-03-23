@@ -61,6 +61,7 @@ pub fn update_charts(
         let _ = link_format.put("AutoUpdate", Variant::from(PpUpdateOption::Manual as i32));
 
         updated += 1;
+        super::verbose::detail(chart_ref.slide_index, &chart_ref.name, "linked + refreshed");
     }
 
     Ok(updated)

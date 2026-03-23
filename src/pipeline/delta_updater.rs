@@ -194,6 +194,11 @@ pub fn update_deltas(
         let _ = new_shape.put("Name", Variant::from(new_name.as_str()));
 
         count += 1;
+        super::verbose::detail(
+            item.slide_index,
+            &item.delt_base_name,
+            &format!("{cell_value} → {sign}"),
+        );
     }
 
     Ok(count)

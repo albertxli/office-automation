@@ -180,6 +180,11 @@ pub fn apply_color_coding(
         }
 
         total_tables += 1;
+        super::verbose::detail(
+            shape_ref.slide_index,
+            &shape_ref.name,
+            &format!("{rows}×{cols} cells"),
+        );
     }
 
     Ok(total_tables)

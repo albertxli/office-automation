@@ -33,13 +33,12 @@ pub fn update_links(
     for ole_ref in &inventory.ole_shapes {
         let mut shape = ole_ref.dispatch.clone();
 
-        // Only set AutoUpdate=Manual — this is cheap (~0.01s/shape)
-        // Do NOT set SourceFullName — that triggers link resolution at 0.5s/shape
         let result = shape.nav("LinkFormat")
             .and_then(|mut lf| lf.put("AutoUpdate", Variant::from(PpUpdateOption::Manual as i32)).map_err(|e| e));
 
         if result.is_ok() {
             updated += 1;
+            super::verbose::detail(ole_ref.slide_index, &ole_ref.name, "AutoUpdate=Manual");
         }
     }
 

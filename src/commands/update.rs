@@ -87,13 +87,23 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
         // Step 0: ZIP pre-relink (before COM, much faster)
         // Skip for dry-run since it modifies the file
         if !args.dry_run {
+            let relink_spinner = if !args.quiet {
+                Some(pipeline::make_spinner_pub("Relink"))
+            } else {
+                None
+            };
+            let relink_t = Instant::now();
+
             let relinked = relink_pptx_zip(&work_path, &pair.excel)
                 .unwrap_or_else(|e| {
                     eprintln!("  ZIP pre-relink warning: {e}");
                     0
                 });
-            if relinked > 0 && !args.quiet {
-                println!("  {} {relinked} links", s_dim.apply_to("ZIP pre-relinked"));
+
+            let relink_elapsed = relink_t.elapsed().as_secs_f64();
+            if let Some(pb) = relink_spinner {
+                pb.finish_and_clear();
+                println!("{}", pipeline::format_step_line_pub("Relink", relinked, relink_elapsed));
             }
         }
 
@@ -106,6 +116,7 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
             &args.skip,
             args.dry_run,
             args.quiet,
+            args.verbose,
         );
 
         match result {
@@ -141,6 +152,7 @@ fn run_com_pipeline(
     steps_skip: &[String],
     dry_run: bool,
     quiet: bool,
+    verbose: bool,
 ) -> OaResult<PipelineResults> {
     let pptx_str = strip_unc(&pptx_path.canonicalize()?);
     let excel_str = strip_unc(&excel_path.canonicalize()?);
@@ -183,6 +195,7 @@ fn run_com_pipeline(
         steps_include,
         steps_skip,
         quiet,
+        verbose,
     )?;
 
     // Save (unless dry-run)
