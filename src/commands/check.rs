@@ -133,15 +133,21 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config) -> 
     let mut result = CheckResult::default();
 
     // Check tables
+    let sp = make_check_spinner("Tables");
     check_tables(&inventory, &mut excel_app, &excel_str, config, &mut result);
+    sp.finish_and_clear();
     print_check_row("Tables", result.tbl_checked, None, result.tbl_mismatches.len());
 
     // Check deltas
+    let sp = make_check_spinner("Deltas");
     check_deltas(&inventory, &mut excel_app, &excel_str, &mut result);
+    sp.finish_and_clear();
     print_check_row("Deltas", result.delt_checked, None, result.delt_mismatches.len());
 
     // Check charts
+    let sp = make_check_spinner("Charts");
     check_charts(&inventory, &mut excel_app, &excel_str, pptx, &mut result);
+    sp.finish_and_clear();
     print_check_row("Charts", result.chart_count, Some(result.chart_series_checked), result.chart_mismatches.len());
 
     // Cleanup
@@ -185,6 +191,22 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config) -> 
     }
 
     Ok(result)
+}
+
+/// Create a spinner for a check step.
+fn make_check_spinner(name: &str) -> indicatif::ProgressBar {
+    let leader_len = 20usize.saturating_sub(name.len());
+    let leaders = "·".repeat(leader_len);
+    let pb = indicatif::ProgressBar::new_spinner();
+    pb.set_style(
+        indicatif::ProgressStyle::default_spinner()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+            .template("  {spinner:.cyan} {msg}")
+            .unwrap()
+    );
+    pb.set_message(format!("{name} {leaders}"));
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb
 }
 
 /// Print a check result row per V3 design spec.
