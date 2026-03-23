@@ -47,23 +47,18 @@ pub fn run_pipeline(
 
     let mut results = PipelineResults::default();
 
-    // Step 1: Links
+    // Step 1: Links (AutoUpdate=Manual only — paths handled by ZIP pre-relink)
     if active_steps.iter().any(|s| s == "links") {
-        let t = std::time::Instant::now();
         results.links_updated = linker::update_links(inventory, excel_path, config)?;
-        eprintln!("    [links: {:.1}s]", t.elapsed().as_secs_f64());
     }
 
     // Step 2: Tables
     if active_steps.iter().any(|s| s == "tables") {
-        let t = std::time::Instant::now();
         results.tables_updated = table_updater::update_tables(inventory, config, excel_app, excel_path)?;
-        eprintln!("    [tables: {:.1}s]", t.elapsed().as_secs_f64());
     }
 
     // Step 3: Deltas
     if active_steps.iter().any(|s| s == "deltas") {
-        let t = std::time::Instant::now();
         results.deltas_updated = delta_updater::update_deltas(
             inventory,
             config,
@@ -71,21 +66,16 @@ pub fn run_pipeline(
             excel_path,
             excel_app,
         )?;
-        eprintln!("    [deltas: {:.1}s]", t.elapsed().as_secs_f64());
     }
 
     // Step 4: Coloring
     if active_steps.iter().any(|s| s == "coloring") {
-        let t = std::time::Instant::now();
         results.tables_colored = color_coder::apply_color_coding(inventory, config)?;
-        eprintln!("    [coloring: {:.1}s]", t.elapsed().as_secs_f64());
     }
 
     // Step 5: Charts
     if active_steps.iter().any(|s| s == "charts") {
-        let t = std::time::Instant::now();
         results.charts_updated = chart_updater::update_charts(inventory, excel_path)?;
-        eprintln!("    [charts: {:.1}s]", t.elapsed().as_secs_f64());
     }
 
     Ok(results)

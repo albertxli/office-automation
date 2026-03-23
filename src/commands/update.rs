@@ -6,6 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use colored::Colorize;
+
 use crate::cli::{parse_pair, UpdateArgs};
 use crate::com::dispatch::Dispatch;
 use crate::com::session::{create_instance, init_com_sta, spawn_dialog_dismisser, stop_dialog_dismisser};
@@ -51,7 +53,9 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        println!("Processing: {file_name}");
+        if !args.quiet {
+            println!("{} {}", "Processing:".bold(), file_name);
+        }
 
         // Determine output path
         let work_path = if let Some(output) = &pair.output {
@@ -77,8 +81,8 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
                     eprintln!("  ZIP pre-relink warning: {e}");
                     0
                 });
-            if relinked > 0 {
-                println!("  ZIP pre-relinked {relinked} links");
+            if relinked > 0 && !args.quiet {
+                println!("  {} {relinked} links", "ZIP pre-relinked".dimmed());
             }
         }
 
@@ -95,24 +99,26 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
         match result {
             Ok(results) => {
                 let elapsed = start.elapsed().as_secs_f64();
-                print_step_results(&results);
-                if !args.dry_run {
-                    println!("  Saved in {elapsed:.1}s");
-                } else {
-                    println!("  Dry run ({elapsed:.1}s, not saved)");
+                if !args.quiet {
+                    print_step_results(&results);
+                    if !args.dry_run {
+                        println!("  {} {elapsed:.1}s", "Done in".green());
+                    } else {
+                        println!("  {} ({elapsed:.1}s)", "Dry run — not saved".yellow());
+                    }
                 }
                 all_results.push((file_name, results, elapsed));
             }
             Err(e) => {
-                eprintln!("  Error: {e}");
+                eprintln!("  {} {e}", "Error:".red().bold());
             }
         }
     }
 
     // Summary
-    if pairs.len() > 1 {
+    if pairs.len() > 1 && !args.quiet {
         let total_elapsed = total_start.elapsed().as_secs_f64();
-        println!("\nBatch complete: {} files in {total_elapsed:.1}s", pairs.len());
+        println!("\n{} {} files in {total_elapsed:.1}s", "Batch complete:".green().bold(), pairs.len());
     }
 
     Ok(())
@@ -273,18 +279,18 @@ fn pick_excel_file() -> OaResult<PathBuf> {
 
 fn print_step_results(results: &PipelineResults) {
     if results.links_updated > 0 {
-        println!("  Links:    {}", results.links_updated);
+        println!("  {} {}", "Links:".cyan(), results.links_updated);
     }
     if results.tables_updated > 0 {
-        println!("  Tables:   {}", results.tables_updated);
+        println!("  {} {}", "Tables:".cyan(), results.tables_updated);
     }
     if results.deltas_updated > 0 {
-        println!("  Deltas:   {}", results.deltas_updated);
+        println!("  {} {}", "Deltas:".cyan(), results.deltas_updated);
     }
     if results.tables_colored > 0 {
-        println!("  Coloring: {}", results.tables_colored);
+        println!("  {} {}", "Coloring:".cyan(), results.tables_colored);
     }
     if results.charts_updated > 0 {
-        println!("  Charts:   {}", results.charts_updated);
+        println!("  {} {}", "Charts:".cyan(), results.charts_updated);
     }
 }

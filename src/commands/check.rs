@@ -3,6 +3,8 @@
 //! Cell-by-cell comparison of tables, delta sign verification.
 //! Returns exit code 0 if all match, 1 if mismatches found.
 
+use colored::Colorize;
+
 use crate::com::dispatch::Dispatch;
 use crate::com::session::{create_instance, init_com_sta, spawn_dialog_dismisser, stop_dialog_dismisser};
 use crate::com::variant::Variant;
@@ -170,24 +172,25 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config) -> 
     // Print results
     println!();
     if !result.tbl_mismatches.is_empty() {
-        println!("TABLE MISMATCHES ({}):", result.tbl_mismatches.len());
+        println!("{} ({}):", "TABLE MISMATCHES".red().bold(), result.tbl_mismatches.len());
         for m in &result.tbl_mismatches {
-            println!("  Slide {}, {}: {}", m.slide, m.shape, m.detail);
+            println!("  Slide {}, {}: {}", m.slide, m.shape.yellow(), m.detail);
         }
     }
     if !result.delt_mismatches.is_empty() {
-        println!("DELTA MISMATCHES ({}):", result.delt_mismatches.len());
+        println!("{} ({}):", "DELTA MISMATCHES".red().bold(), result.delt_mismatches.len());
         for m in &result.delt_mismatches {
-            println!("  Slide {}, {}: {}", m.slide, m.shape, m.detail);
+            println!("  Slide {}, {}: {}", m.slide, m.shape.yellow(), m.detail);
         }
     }
 
     println!();
     if result.passed() {
-        println!("CHECK PASSED: {} tables, {} deltas verified",
-            result.tbl_checked, result.delt_checked);
+        println!("{} {} tables, {} deltas verified",
+            "CHECK PASSED".green().bold(), result.tbl_checked, result.delt_checked);
     } else {
-        println!("CHECK FAILED: {} table mismatches, {} delta mismatches (of {} checked)",
+        println!("{} {} table mismatches, {} delta mismatches (of {} checked)",
+            "CHECK FAILED".red().bold(),
             result.tbl_mismatches.len(),
             result.delt_mismatches.len(),
             result.total_checked());

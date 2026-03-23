@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use colored::Colorize;
+
 use crate::com::dispatch::Dispatch;
 use crate::com::session::{create_instance, init_com_sta, spawn_dialog_dismisser, stop_dialog_dismisser};
 use crate::com::variant::Variant;
@@ -90,41 +92,45 @@ pub fn run_info(pptx_path: &str) -> OaResult<()> {
 
     // --- Print results ---
     println!();
-    println!("Presentation");
+    println!("{}", "Presentation".bold());
     println!("  File:   {}", Path::new(pptx_path).file_name().unwrap_or_default().to_string_lossy());
     println!("  Slides: {slide_count}");
 
     println!();
-    println!("OLE Links");
+    println!("{}", "OLE Links".bold());
     let total_ole: usize = ole_sources.values().sum();
     if ole_sources.is_empty() {
-        println!("  (none)");
+        println!("  {}", "(none)".dimmed());
     } else {
         let mut sorted: Vec<_> = ole_sources.iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(a.1)); // most common first
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
         for (src, count) in &sorted {
-            println!("  {:<60} {:>4}", src, count);
+            println!("  {:<60} {:>4}", src.dimmed(), count);
         }
-        println!("  {:<60} {:>4}", "Total", total_ole);
+        println!("  {:<60} {:>4}", "Total".bold(), total_ole);
     }
 
     println!();
-    println!("Charts");
+    println!("{}", "Charts".bold());
     println!("  Linked:   {}", inventory.charts.len());
     println!("  Unlinked: {unlinked_charts}");
 
     println!();
-    println!("Special Shapes");
-    println!("  ntbl_ (normal tables):    {}", inventory.count_ntbl);
-    println!("  htmp_ (heatmap tables):   {}", inventory.count_htmp);
-    println!("  trns_ (transposed):       {}", inventory.count_trns);
-    println!("  delt_ (delta indicators): {}", inventory.count_delt);
-    println!("  _ccst (color-coded):      {}", inventory.count_ccst);
+    println!("{}", "Special Shapes".bold());
+    println!("  {} {}", "ntbl_ (normal tables):   ".cyan(), inventory.count_ntbl);
+    println!("  {} {}", "htmp_ (heatmap tables):  ".cyan(), inventory.count_htmp);
+    println!("  {} {}", "trns_ (transposed):      ".cyan(), inventory.count_trns);
+    println!("  {} {}", "delt_ (delta indicators):".cyan(), inventory.count_delt);
+    println!("  {} {}", "_ccst (color-coded):     ".cyan(), inventory.count_ccst);
 
     println!();
-    println!("Delta Templates (Slide 1)");
+    println!("{}", "Delta Templates (Slide 1)".bold());
     for (name, found) in &template_found {
-        let marker = if *found { "\u{2713}" } else { "\u{2717}" };
+        let marker = if *found {
+            "\u{2713}".green().to_string()
+        } else {
+            "\u{2717}".red().to_string()
+        };
         println!("  {name:<30} {marker}");
     }
 
