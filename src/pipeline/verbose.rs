@@ -37,6 +37,31 @@ pub fn detail(slide: i32, shape: &str, info: &str) {
         s.apply_to(info));
 }
 
+/// Print a verbose check detail line with type column and colored checkmark.
+///
+/// Format: `      Slide  3 │ table │ ntbl_Object_edu          ✓ (1,1) '74%'`
+/// Checkmark is green for pass, red for fail. Values in default white.
+pub fn check_detail(slide: i32, check_type: &str, shape: &str, passed: bool, info: &str) {
+    if !is_verbose() {
+        return;
+    }
+    let s = Style::new().dim();
+    let mark = if passed {
+        Style::new().green().apply_to("✓")
+    } else {
+        Style::new().red().apply_to("✗")
+    };
+    println!("      {} {:>2} {} {:<5} {} {:<24} {} {}",
+        s.apply_to("Slide"),
+        s.apply_to(slide),
+        s.apply_to("│"),
+        s.apply_to(check_type),
+        s.apply_to("│"),
+        s.apply_to(shape),
+        mark,
+        info);
+}
+
 /// Print a verbose line without slide context.
 pub fn note(msg: &str) {
     if !is_verbose() {

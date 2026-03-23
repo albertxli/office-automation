@@ -84,8 +84,9 @@ pub fn apply_ccst_transform(text: &str, config: &Config) -> String {
 }
 
 /// Run the `oa check` command.
-pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config) -> OaResult<CheckResult> {
+pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config, verbose: bool) -> OaResult<CheckResult> {
     let overall_start = Instant::now();
+    crate::pipeline::verbose::set_verbose(verbose);
     let pptx = std::path::Path::new(pptx_path);
     if !pptx.exists() {
         return Err(crate::error::OaError::Other(format!("File not found: {pptx_path}")));
@@ -95,12 +96,11 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config) -> 
     let s_target = Style::new().cyan();
     let s_dim = Style::new().dim();
 
-    // Header (wider divider for check — no source file line)
+    // Header with data file path
     let file_name = pptx.file_name().unwrap_or_default().to_string_lossy();
+    let s_source = Style::new().yellow();
     println!();
     println!("  {} {}", s_target.apply_to("▸"), s_target.apply_to(&*file_name));
-    println!("  {}", s_dim.apply_to("╌".repeat(64)));
-    println!();
 
     let _com = init_com_sta()?;
     let (stop, handle) = spawn_dialog_dismisser();
@@ -130,24 +130,34 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config) -> 
             .ok_or_else(|| crate::error::OaError::Other("Cannot auto-detect Excel file. Use -e.".into()))?
     };
 
+    // Finish header with data path + divider
+    let excel_filename = std::path::Path::new(&excel_str)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| excel_str.clone());
+    println!("    {} {}", s_source.apply_to("←"), s_source.apply_to(&excel_filename));
+    println!("  {}", s_dim.apply_to("╌".repeat(64)));
+    println!();
+
     let mut result = CheckResult::default();
 
     // Check tables
-    let sp = make_check_spinner("Tables");
+    let sp = if !verbose { Some(make_check_spinner("Tables")) } else { None };
     check_tables(&inventory, &mut excel_app, &excel_str, config, &mut result);
-    sp.finish_and_clear();
-    print_check_row("Tables", result.tbl_checked, None, result.tbl_mismatches.len());
+    if let Some(sp) = sp { sp.finish_and_clear(); }
 
-    // Check deltas
-    let sp = make_check_spinner("Deltas");
+    let sp = if !verbose { Some(make_check_spinner("Deltas")) } else { None };
     check_deltas(&inventory, &mut excel_app, &excel_str, &mut result);
-    sp.finish_and_clear();
-    print_check_row("Deltas", result.delt_checked, None, result.delt_mismatches.len());
+    if let Some(sp) = sp { sp.finish_and_clear(); }
 
-    // Check charts
-    let sp = make_check_spinner("Charts");
+    let sp = if !verbose { Some(make_check_spinner("Charts")) } else { None };
     check_charts(&inventory, &mut excel_app, &excel_str, pptx, &mut result);
-    sp.finish_and_clear();
+    if let Some(sp) = sp { sp.finish_and_clear(); }
+
+    // Summary table (always shown — in verbose mode it's the only summary)
+    println!();
+    print_check_row("Tables", result.tbl_checked, None, result.tbl_mismatches.len());
+    print_check_row("Deltas", result.delt_checked, None, result.delt_mismatches.len());
     print_check_row("Charts", result.chart_count, Some(result.chart_series_checked), result.chart_mismatches.len());
 
     // Cleanup
@@ -319,6 +329,13 @@ fn check_tables(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path
                         slide: ole_ref.slide_index, shape: ole_ref.name.clone(), category: "table".into(),
                         detail: format!("({pr},{pc}): PPT={:?} vs Excel={:?}", ppt_text.trim(), expected),
                     });
+                    crate::pipeline::verbose::check_detail(
+                        ole_ref.slide_index, "table", &table_info.name, false,
+                        &format!("({pr},{pc}) PPT='{}' Excel='{}'", ppt_text.trim(), expected));
+                } else {
+                    crate::pipeline::verbose::check_detail(
+                        ole_ref.slide_index, "table", &table_info.name, true,
+                        &format!("({pr},{pc}) '{}'", ppt_text.trim()));
                 }
             }
         }
@@ -364,6 +381,13 @@ fn check_deltas(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path
                 slide: ole_ref.slide_index, shape: delt_ref.name.clone(), category: "delta".into(),
                 detail: format!("actual={actual_sign}, expected={expected_sign} (value: {excel_text:?})"),
             });
+            crate::pipeline::verbose::check_detail(
+                ole_ref.slide_index, "delta", &delt_ref.name, false,
+                &format!("sign={actual_sign} expected={expected_sign} ({excel_text})"));
+        } else {
+            crate::pipeline::verbose::check_detail(
+                ole_ref.slide_index, "delta", &delt_ref.name, true,
+                &format!("sign={actual_sign} ({excel_text})"));
         }
     }
 }
@@ -438,6 +462,7 @@ fn check_charts(
 
             // Check 1: link points to correct Excel
             let source_lower = link_source.to_lowercase();
+            let mut chart_ok = true;
             if !source_lower.is_empty() && source_lower != "null"
                 && !source_lower.contains(&excel_filename)
             {
@@ -448,6 +473,10 @@ fn check_charts(
                     category: "chart".into(),
                     detail: format!("wrong link: {short}"),
                 });
+                chart_ok = false;
+                crate::pipeline::verbose::check_detail(
+                    chart_ref.slide_index, "chart", &chart_ref.name, false,
+                    &format!("wrong link: {short}"));
             }
 
             // Check 2: series count matches
@@ -458,6 +487,16 @@ fn check_charts(
                     category: "chart".into(),
                     detail: format!("series: COM={series_count} XML={expected_series}"),
                 });
+                chart_ok = false;
+                crate::pipeline::verbose::check_detail(
+                    chart_ref.slide_index, "chart", &chart_ref.name, false,
+                    &format!("series: COM={series_count} XML={expected_series}"));
+            }
+
+            if chart_ok {
+                crate::pipeline::verbose::check_detail(
+                    chart_ref.slide_index, "chart", &chart_ref.name, true,
+                    &format!("linked ({series_count} series)"));
             }
         }
     }

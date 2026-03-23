@@ -35,7 +35,7 @@ fn main() {
             if let Err(e) = config.apply_overrides(&args.set) {
                 return eprintln!("Error: {e}");
             }
-            match commands::check::run_check(&args.file, args.excel.as_deref(), &config) {
+            match commands::check::run_check(&args.file, args.excel.as_deref(), &config, args.verbose) {
                 Ok(result) => {
                     if !result.passed() {
                         std::process::exit(1);
