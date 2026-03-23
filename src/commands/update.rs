@@ -157,7 +157,11 @@ fn run_com_pipeline(
     let pptx_str = strip_unc(&pptx_path.canonicalize()?);
     let excel_str = strip_unc(&excel_path.canonicalize()?);
 
+    use crate::pipeline::verbose;
+    verbose::set_verbose(verbose);
+
     // Initialize COM
+    let t_setup = std::time::Instant::now();
     let _com = init_com_sta()?;
     let (stop, handle) = spawn_dialog_dismisser();
 
@@ -171,8 +175,10 @@ fn run_com_pipeline(
     // Create PowerPoint
     let mut ppt_app = create_instance("PowerPoint.Application")?;
     ppt_app.put("DisplayAlerts", Variant::from(0i32))?;
+    verbose::note(&format!("COM setup ·················· {:.1}s", t_setup.elapsed().as_secs_f64()));
 
     // Open presentation
+    let t_open = std::time::Instant::now();
     let mut presentations = Dispatch::new(ppt_app.get("Presentations")?.as_dispatch()?);
     let pres_variant = presentations.call("Open", &[
         Variant::from(pptx_str.as_str()),
@@ -181,9 +187,12 @@ fn run_com_pipeline(
         Variant::from(0i32),  // WithWindow = False
     ])?;
     let mut presentation = Dispatch::new(pres_variant.as_dispatch()?);
+    verbose::note(&format!("Open PPTX ·················· {:.1}s", t_open.elapsed().as_secs_f64()));
 
     // Build inventory
+    let t_inv = std::time::Instant::now();
     let inventory = build_inventory(&mut presentation);
+    verbose::note(&format!("Build inventory ············ {:.1}s", t_inv.elapsed().as_secs_f64()));
 
     // Run pipeline
     let results = pipeline::run_pipeline(
@@ -199,27 +208,26 @@ fn run_com_pipeline(
     )?;
 
     // Save (unless dry-run)
+    let t_save = std::time::Instant::now();
     if !dry_run {
         presentation.call0("Save")?;
     }
+    verbose::note(&format!("Save ······················· {:.1}s", t_save.elapsed().as_secs_f64()));
 
     // GOTCHA #21: Explicit drop ordering to prevent 60s hang
-    // Drop inventory refs (they hold IDispatch pointers into the presentation)
+    let t_teardown = std::time::Instant::now();
     drop(inventory);
-
-    // Close presentation
     presentation.call("Close", &[])?;
     drop(presentation);
     drop(presentations);
 
-    // Restore Excel calculation mode and quit
     let _ = excel_app.put("Calculation", Variant::from(XlCalculation::Automatic as i32));
     excel_app.call0("Quit")?;
     drop(excel_app);
 
-    // Quit PowerPoint
     ppt_app.call0("Quit")?;
     drop(ppt_app);
+    verbose::note(&format!("Teardown ··················· {:.1}s", t_teardown.elapsed().as_secs_f64()));
 
     // Stop dialog dismisser
     stop_dialog_dismisser(stop, handle);
