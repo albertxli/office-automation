@@ -84,30 +84,7 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
 
         let start = Instant::now();
 
-        // Step 0: ZIP pre-relink (before COM, much faster)
-        // Skip for dry-run since it modifies the file
-        if !args.dry_run {
-            let relink_spinner = if !args.quiet {
-                Some(pipeline::make_spinner_pub("Relink"))
-            } else {
-                None
-            };
-            let relink_t = Instant::now();
-
-            let relinked = relink_pptx_zip(&work_path, &pair.excel)
-                .unwrap_or_else(|e| {
-                    eprintln!("  ZIP pre-relink warning: {e}");
-                    0
-                });
-
-            let relink_elapsed = relink_t.elapsed().as_secs_f64();
-            if let Some(pb) = relink_spinner {
-                pb.finish_and_clear();
-                println!("{}", pipeline::format_step_line_pub("Relink", relinked, relink_elapsed));
-            }
-        }
-
-        // COM session
+        // COM session (includes ZIP relink inside, in correct order)
         let result = run_com_pipeline(
             &work_path,
             &pair.excel,
@@ -176,6 +153,25 @@ fn run_com_pipeline(
     let mut ppt_app = create_instance("PowerPoint.Application")?;
     ppt_app.put("DisplayAlerts", Variant::from(0i32))?;
     verbose::note(&format!("COM setup ·················· {:.1}s", t_setup.elapsed().as_secs_f64()));
+
+    // ZIP pre-relink (before Open, so PowerPoint reads corrected paths)
+    if !dry_run {
+        let use_spinner = !quiet && !verbose;
+        let relink_spinner = if use_spinner { Some(pipeline::make_spinner_pub("Relink")) } else { None };
+        let relink_t = std::time::Instant::now();
+
+        let relinked = relink_pptx_zip(pptx_path, excel_path)
+            .unwrap_or_else(|e| {
+                eprintln!("  ZIP pre-relink warning: {e}");
+                0
+            });
+
+        let relink_elapsed = relink_t.elapsed().as_secs_f64();
+        if let Some(pb) = relink_spinner { pb.finish_and_clear(); }
+        if !quiet {
+            println!("{}", pipeline::format_step_line_pub("Relink", relinked, relink_elapsed));
+        }
+    }
 
     // Open presentation
     let t_open = std::time::Instant::now();
