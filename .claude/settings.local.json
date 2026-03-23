@@ -34,7 +34,9 @@
       "Bash(rm -f output/argentina_perf.pptx)",
       "Bash(rm -f output/argentina_pretty.pptx)",
       "Bash(sed 's/.*pub const //')",
-      "Bash(sed 's/:.*//')"
+      "Bash(sed 's/:.*//')",
+      "Bash(rm -f output/malaysia_test.pptx)",
+      "Bash(rm -f output/germany_test.pptx)"
     ]
   }
 }

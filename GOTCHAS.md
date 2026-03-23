@@ -90,6 +90,9 @@ The authoritative reference is `RUN ALL_Table+Chart_v11.bas`, not the old Jupyte
 ### #10 ZIP Corruption
 Be careful with tools that modify PPTX ZIP structure — verify the output is still valid.
 
+### #33 Presentations.Open Untitled=True Breaks Save (Rust-specific)
+Opening with `Untitled=True` (-1) makes PowerPoint treat the file as a new unnamed document. `Save()` then silently does nothing — all changes are lost. **Always use `Untitled=False` (0)** for files you intend to modify and save. This bug caused table cell writes and chart updates to appear successful but produce no changes in the output file.
+
 ### #32 Skip COM SourceFullName — Use ZIP Pre-Relink Only (Rust-specific)
 `LinkFormat.SourceFullName = "..."` triggers PowerPoint to resolve/validate the link target: file I/O, network check, sheet/range validation. This costs **0.5s per shape** (86 shapes = 42.7s). ZIP pre-relink already rewrites all paths in 0.2s directly in the PPTX XML. When PowerPoint opens the file, it reads the ALREADY-CORRECT paths. **Never set SourceFullName via COM** — only use COM to set `AutoUpdate=Manual` (~0.01s/shape). This single optimization took pipeline time from 54s to 9.8s.
 

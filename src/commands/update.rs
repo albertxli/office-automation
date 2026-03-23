@@ -184,7 +184,7 @@ fn run_com_pipeline(
     let pres_variant = presentations.call("Open", &[
         Variant::from(pptx_str.as_str()),
         Variant::from(0i32),  // ReadOnly = False
-        Variant::from(-1i32), // Untitled = True
+        Variant::from(0i32),  // Untitled = False (MUST be False so Save() works)
         Variant::from(0i32),  // WithWindow = False
     ])?;
     let mut presentation = Dispatch::new(pres_variant.as_dispatch()?);

@@ -178,10 +178,11 @@ fn process_table(
             ])?;
             let mut ppt_cell = Dispatch::new(ppt_cell_variant.as_dispatch()?);
 
-            // Set cell text
+            // Set cell text — step by step (nav can lose context on some COM objects)
             let mut cell_shape = Dispatch::new(ppt_cell.get("Shape")?.as_dispatch()?);
-            let _ = cell_shape.nav("TextFrame.TextRange")
-                .and_then(|mut tr| tr.put("Text", Variant::from(cell_text.as_str())).map_err(|e| e));
+            let mut text_frame = Dispatch::new(cell_shape.get("TextFrame")?.as_dispatch()?);
+            let mut text_range = Dispatch::new(text_frame.get("TextRange")?.as_dispatch()?);
+            text_range.put("Text", Variant::from(cell_text.as_str()))?;
 
             // For heatmap: copy fill color and font from Excel
             if !skip_formatting {
