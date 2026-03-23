@@ -117,12 +117,19 @@ pub fn relink_pptx_zip(pptx_path: &Path, new_excel_path: &Path) -> Result<usize,
         }
     }
 
-    // Print chart summary (one line instead of 100 individual lines)
-    if chart_files > 0 {
-        crate::pipeline::verbose::note(
-            &format!("Charts ······················· {} links ({} charts)", chart_links, chart_files)
-        );
-    }
+    // Always show chart summary (even if 0 — user wants to see chart count)
+    // Count total chart .rels files in the ZIP (including unchanged ones)
+    let total_chart_files = (0..reader.len())
+        .filter_map(|i| reader.by_index(i).ok())
+        .filter(|e| {
+            let n = e.name().replace('\\', "/");
+            n.ends_with(".rels") && n.contains("charts/_rels/")
+        })
+        .count();
+
+    crate::pipeline::verbose::note(
+        &format!("Charts ······················· {} relinked ({} total)", chart_links, total_chart_files)
+    );
 
     writer.finish().map_err(|e| format!("Failed to finalize ZIP: {e}"))?;
 
