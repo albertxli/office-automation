@@ -6,8 +6,15 @@ Migrating Python `decx` (reference at `C:\Users\lipov\SynologyDrive\ppt-automati
 
 **Goal:** Feature parity in behavior, but Rust-idiomatic internals that maximize speed. Python processes a 30-slide/86-OLE/100-chart deck in ~40s — we target <15s single file, with true parallel batch processing.
 
+**Status (Session 1 complete):**
+- All 7 commands working and verified
+- 6.0s pipeline (6.7x faster than Python's ~40s)
+- 387/387 check cells pass (verified by decx check)
+- 33 COM gotchas documented
+- 187 total tests passing
+
 **Decisions made:**
-- TOML-only runfiles (clean break from Python runfiles)
+- Both TOML and Python (.py) runfiles supported (auto-detect by extension)
 - Include `--pick` (native file dialog via `rfd`) in v0.1
 - Build strictly sequential: Phase 0 → Phase 1 → Phase 2 → ...
 
