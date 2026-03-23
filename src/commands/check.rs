@@ -428,6 +428,12 @@ fn check_charts(
         }
     };
 
+    // Pre-read chart cached values from ZIP — avoids COM Series.Values calls
+    let chart_cache_map = match build_chart_cache_map(pptx_path) {
+        Ok(m) => m,
+        Err(_) => HashMap::new(), // Fall back to empty — will use COM
+    };
+
     let excel_filename = std::path::Path::new(excel_path)
         .file_name()
         .map(|f| f.to_string_lossy().to_lowercase())
@@ -515,8 +521,9 @@ fn check_charts(
 
             // Check 3: series values match (always attempt if we have refs)
             if let Some(series_refs) = refs {
+                let cached = chart_cache_map.get(&key).cloned().unwrap_or_default();
                 let value_ok = check_chart_series_values(
-                    &mut shape, &mut workbooks, excel_path, series_refs,
+                    &cached, &mut workbooks, excel_path, series_refs,
                     chart_ref, series_count, result,
                 );
                 if value_ok && chart_ok {
@@ -543,7 +550,7 @@ fn check_charts(
 ///
 /// Returns true if all series match, false if any mismatch found.
 fn check_chart_series_values(
-    shape: &mut Dispatch,
+    ppt_cached: &[(String, Vec<f64>)],  // ZIP-cached values (ref, values) per series
     workbooks: &mut Dispatch,
     excel_path: &str,
     series_refs: &[String],
@@ -551,27 +558,14 @@ fn check_chart_series_values(
     series_count: i32,
     result: &mut CheckResult,
 ) -> bool {
-    let mut sc = match shape.nav("Chart")
-        .and_then(|mut ch| ch.call("SeriesCollection", &[]))
-        .and_then(|v| v.as_dispatch())
-        .map(Dispatch::new)
-    {
-        Ok(sc) => sc,
-        Err(_) => {
-            result.chart_series_checked += series_count as usize;
-            return true; // Can't access series — treat as OK (count check passed)
-        }
-    };
-
     let mut wb = match open_or_get_workbook(workbooks, excel_path) {
         Ok(wb) => wb,
         Err(_) => {
             result.chart_series_checked += series_count as usize;
-            return true; // Can't open workbook — treat as OK
+            return true;
         }
     };
 
-    // Collect all mismatches first, then print with aligned padding
     struct SeriesMismatch {
         name: String,
         diff_count: usize,
@@ -585,17 +579,11 @@ fn check_chart_series_values(
         let series_idx = (i + 1) as i32;
         result.chart_series_checked += 1;
 
-        let mut series = match sc.call("Item", &[Variant::from(series_idx)])
-            .and_then(|v| v.as_dispatch())
-            .map(Dispatch::new)
-        {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        let ppt_values = match read_ppt_series_values(&mut series) {
-            Ok(v) => v,
-            Err(_) => continue,
+        // PPT side: read from ZIP cache instead of COM Series.Values
+        let ppt_values = if i < ppt_cached.len() {
+            ppt_cached[i].1.clone()
+        } else {
+            continue; // No cached data for this series
         };
 
         let excel_values = match read_chart_range(&mut wb, range_ref) {
@@ -604,9 +592,8 @@ fn check_chart_series_values(
         };
 
         if !values_match(&ppt_values, &excel_values) {
-            let series_name_raw = series.get("Name")
-                .and_then(|v| v.as_string())
-                .unwrap_or_else(|_| format!("Series {series_idx}"));
+            // Use series name from the ZIP cache ref, or fallback
+            let series_name_raw = format!("Series {series_idx}");
             let series_name = crate::pipeline::verbose::truncate_middle(&series_name_raw);
             let (diff_count, pairs, has_more) = collect_mismatch_pairs(&ppt_values, &excel_values, 6);
             let total = ppt_values.len().max(excel_values.len());
@@ -758,6 +745,50 @@ fn build_chart_ref_map(pptx_path: &std::path::Path) -> Result<HashMap<(i32, usiz
                 let refs = extract_series_refs(&chart_xml);
                 if !refs.is_empty() {
                     result.insert((slide_num, pos), refs);
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Build chart CACHED VALUES map from PPTX ZIP.
+/// Returns: {(slide_num, chart_position) → Vec<(range_ref, cached_values)>}
+/// This reads <c:numCache> values directly from the ZIP — no COM needed.
+fn build_chart_cache_map(pptx_path: &std::path::Path) -> Result<HashMap<(i32, usize), Vec<(String, Vec<f64>)>>, String> {
+    let file = std::fs::File::open(pptx_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    let mut result: HashMap<(i32, usize), Vec<(String, Vec<f64>)>> = HashMap::new();
+
+    let slide_order = get_slide_order(&mut archive)?;
+
+    for (com_index, slide_file) in slide_order.iter().enumerate() {
+        let slide_num = (com_index + 1) as i32;
+        let slide_filename = slide_file.rsplit('/').next().unwrap_or(slide_file);
+        let rels_path = format!("ppt/slides/_rels/{slide_filename}.rels");
+        let rels_map = read_rels_map(&mut archive, &rels_path);
+        let slide_xml = match read_zip_entry(&mut archive, slide_file) {
+            Some(data) => data,
+            None => continue,
+        };
+        let chart_positions = find_charts_in_slide(&slide_xml, &rels_map);
+
+        for (pos, chart_path) in chart_positions {
+            let chart_filename = chart_path.rsplit('/').next().unwrap_or(&chart_path);
+            let chart_rels_path = format!("ppt/charts/_rels/{chart_filename}.rels");
+            if !has_external_link(&mut archive, &chart_rels_path) {
+                continue;
+            }
+            let full_chart_path = if chart_path.starts_with("ppt/") {
+                chart_path.clone()
+            } else {
+                format!("ppt/charts/{}", chart_path.trim_start_matches("../charts/"))
+            };
+            if let Some(chart_xml) = read_zip_entry(&mut archive, &full_chart_path) {
+                let cached = crate::zip_ops::chart_data::extract_cached_values(&chart_xml);
+                if !cached.is_empty() {
+                    result.insert((slide_num, pos), cached);
                 }
             }
         }

@@ -399,6 +399,132 @@ pub fn collect_unique_ranges(chart_ranges: &HashMap<String, Vec<String>>) -> Vec
     unique.into_iter().collect()
 }
 
+/// Extract cached numCache values from chart XML per series.
+///
+/// Returns Vec of (range_ref, Vec<f64>) for each series — the PPT-side cached values.
+/// Only extracts from `<c:val>` (GOTCHA #23).
+pub fn extract_cached_values(xml: &str) -> Vec<(String, Vec<f64>)> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_reader(xml.as_bytes());
+    let mut series_data: Vec<(String, Vec<f64>)> = Vec::new();
+
+    let mut in_ser = false;
+    let mut in_val = false;
+    let mut in_num_ref = false;
+    let mut in_num_cache = false;
+    let mut in_f = false;
+    let mut in_pt = false;
+    let mut in_v = false;
+
+    let mut current_ref = String::new();
+    let mut current_values: Vec<f64> = Vec::new();
+    let mut current_pt_idx: usize = 0;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                match e.local_name().as_ref() {
+                    b"ser" => { in_ser = true; current_ref.clear(); current_values.clear(); }
+                    b"val" if in_ser => { in_val = true; }
+                    b"numRef" if in_val => { in_num_ref = true; }
+                    b"f" if in_num_ref => { in_f = true; }
+                    b"numCache" if in_num_ref => { in_num_cache = true; }
+                    b"pt" if in_num_cache => {
+                        in_pt = true;
+                        current_pt_idx = e.try_get_attribute("idx")
+                            .ok().flatten()
+                            .and_then(|a| String::from_utf8_lossy(a.value.as_ref()).parse::<usize>().ok())
+                            .unwrap_or(0);
+                        // Extend values vec to fit this index
+                        while current_values.len() <= current_pt_idx {
+                            current_values.push(0.0);
+                        }
+                    }
+                    b"v" if in_pt => { in_v = true; }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                match e.local_name().as_ref() {
+                    b"ser" => {
+                        if !current_ref.is_empty() {
+                            series_data.push((current_ref.clone(), current_values.clone()));
+                        }
+                        in_ser = false; in_val = false; in_num_ref = false;
+                        in_num_cache = false; current_ref.clear(); current_values.clear();
+                    }
+                    b"val" => { in_val = false; in_num_ref = false; in_num_cache = false; }
+                    b"numRef" => { in_num_ref = false; in_num_cache = false; }
+                    b"numCache" => { in_num_cache = false; }
+                    b"f" => { in_f = false; }
+                    b"pt" => { in_pt = false; }
+                    b"v" => { in_v = false; }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(ref t)) => {
+                if in_f && in_num_ref && in_val {
+                    current_ref = String::from_utf8_lossy(t.as_ref()).trim().to_string();
+                } else if in_v && in_pt && in_num_cache {
+                    if let Ok(val) = String::from_utf8_lossy(t.as_ref()).trim().parse::<f64>() {
+                        if current_pt_idx < current_values.len() {
+                            current_values[current_pt_idx] = val;
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    series_data
+}
+
+/// Read all chart cached values from a PPTX ZIP.
+///
+/// Returns: HashMap<(slide_num, chart_position) → Vec<(range_ref, cached_values)>>
+/// This matches the same key scheme as `build_chart_ref_map` in check.rs.
+pub fn read_all_chart_cache(pptx_path: &std::path::Path) -> Result<HashMap<String, Vec<(String, Vec<f64>)>>, String> {
+    let data = std::fs::read(pptx_path).map_err(|e| format!("Failed to read PPTX: {e}"))?;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&data))
+        .map_err(|e| format!("Failed to open ZIP: {e}"))?;
+
+    let mut result: HashMap<String, Vec<(String, Vec<f64>)>> = HashMap::new();
+
+    let chart_names: Vec<String> = (0..archive.len())
+        .filter_map(|i| {
+            let entry = archive.by_index(i).ok()?;
+            let name = entry.name().to_string();
+            if name.starts_with("ppt/charts/chart") && name.ends_with(".xml") && !name.contains(".rels") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for chart_name in &chart_names {
+        let chart_filename = chart_name.rsplit('/').next().unwrap_or(chart_name);
+        let rels_path = format!("ppt/charts/_rels/{chart_filename}.rels");
+        if !has_external_link(&mut archive, &rels_path) {
+            continue;
+        }
+
+        if let Some(xml) = read_entry(&mut archive, chart_name) {
+            let cached = extract_cached_values(&xml);
+            if !cached.is_empty() {
+                result.insert(chart_name.clone(), cached);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
