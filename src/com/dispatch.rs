@@ -46,6 +46,23 @@ impl Dispatch {
         }
     }
 
+    /// Create a Dispatch that shares an existing DISPID cache.
+    ///
+    /// Use when wrapping COM objects of the same class (e.g., all Table Cell objects
+    /// share the same DISPIDs for "Shape", "TextFrame", etc.). Avoids redundant
+    /// GetIDsOfNames calls after the first object resolves each name.
+    pub fn new_with_cache(inner: IDispatch, cache: Rc<RefCell<HashMap<String, i32>>>) -> Self {
+        Self {
+            inner,
+            dispid_cache: cache,
+        }
+    }
+
+    /// Get the DISPID cache for sharing with other Dispatch instances of the same COM class.
+    pub fn cache(&self) -> Rc<RefCell<HashMap<String, i32>>> {
+        self.dispid_cache.clone()
+    }
+
     /// Get the underlying IDispatch reference (for passing to COM functions).
     pub fn as_raw(&self) -> &IDispatch {
         &self.inner

@@ -306,22 +306,33 @@ fn check_tables(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path
         let do_transpose = table_info.table_type == TableType::Transposed;
         let is_ccst = table_info.name.contains("_ccst");
 
+        // Shared DISPID caches — same-class COM objects reuse resolved DISPIDs
+        let excel_cell_cache = cells.cache();
+        let ppt_cell_cache = tbl.cache();
+        // GOTCHA #31: DISPIDs are per-COM-class — each class needs its own cache
+        let shape_cache: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, i32>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+        let tf_cache: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, i32>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+        let tr_cache: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, i32>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+
         for r in 1..=rows {
             for c in 1..=cols {
                 let excel_text = cells.call("Item", &[Variant::from(r), Variant::from(c)])
-                    .and_then(|v| v.as_dispatch().map_err(|e| e)).and_then(|d| Dispatch::new(d).get("Text"))
-                    .and_then(|v| v.as_string().map_err(|e| e)).unwrap_or_default();
+                    .and_then(|v| v.as_dispatch()).and_then(|d| Dispatch::new_with_cache(d, excel_cell_cache.clone()).get("Text"))
+                    .and_then(|v| v.as_string()).unwrap_or_default();
                 let (pr, pc) = if do_transpose { (c, r) } else { (r, c) };
                 let ppt_text = tbl.call("Cell", &[Variant::from(pr), Variant::from(pc)])
-                    .and_then(|v| v.as_dispatch().map_err(|e| e))
+                    .and_then(|v| v.as_dispatch())
                     .and_then(|d| {
-                        let mut cell = Dispatch::new(d);
-                        let mut shape = Dispatch::new(cell.get("Shape")?.as_dispatch()?);
-                        let mut tf = Dispatch::new(shape.get("TextFrame")?.as_dispatch()?);
-                        let mut tr = Dispatch::new(tf.get("TextRange")?.as_dispatch()?);
+                        let mut cell = Dispatch::new_with_cache(d, ppt_cell_cache.clone());
+                        let mut shape = Dispatch::new_with_cache(cell.get("Shape")?.as_dispatch()?, shape_cache.clone());
+                        let mut tf = Dispatch::new_with_cache(shape.get("TextFrame")?.as_dispatch()?, tf_cache.clone());
+                        let mut tr = Dispatch::new_with_cache(tf.get("TextRange")?.as_dispatch()?, tr_cache.clone());
                         tr.get("Text")
                     })
-                    .and_then(|v| v.as_string().map_err(|e| e)).unwrap_or_default();
+                    .and_then(|v| v.as_string()).unwrap_or_default();
                 let expected = if is_ccst { apply_ccst_transform(&excel_text, config) } else { excel_text.trim().to_string() };
                 result.tbl_checked += 1;
                 if ppt_text.trim() != expected {
@@ -508,11 +519,13 @@ fn check_charts(
                     &mut shape, &mut workbooks, excel_path, series_refs,
                     chart_ref, series_count, result,
                 );
-                if chart_ok && value_ok {
+                if value_ok && chart_ok {
                     crate::pipeline::verbose::check_detail(
                         chart_ref.slide_index, "chart", &chart_ref.name, true,
                         &format!("verified ({series_count} series)"));
                 }
+                // Note: when !value_ok, the ✗ parent line + ╰ diffs are printed
+                // inside check_chart_series_values before it returns.
             } else {
                 // No XML refs — count-only
                 result.chart_series_checked += series_count as usize;
@@ -609,12 +622,18 @@ fn check_chart_series_values(
         }
     }
 
-    // Find max series name length for padding within this chart
-    let max_name_len = mismatches.iter().map(|m| m.name.len()).max().unwrap_or(0);
+    if !mismatches.is_empty() {
+        // Print ✗ parent line before ╰ continuation lines
+        let total_diffs: usize = mismatches.iter().map(|m| m.diff_count).sum();
+        crate::pipeline::verbose::check_detail(
+            chart_ref.slide_index, "chart", &chart_ref.name, false,
+            &format!("{total_diffs} values differ ({series_count} series)"));
 
-    for m in &mismatches {
-        crate::pipeline::verbose::check_chart_series_diff(
-            &m.name, max_name_len, m.diff_count, m.total, &m.pairs, m.has_more);
+        let max_name_len = mismatches.iter().map(|m| m.name.len()).max().unwrap_or(0);
+        for m in &mismatches {
+            crate::pipeline::verbose::check_chart_series_diff(
+                &m.name, max_name_len, m.diff_count, m.total, &m.pairs, m.has_more);
+        }
     }
 
     mismatches.is_empty()

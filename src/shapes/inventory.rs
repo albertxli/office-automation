@@ -128,10 +128,13 @@ pub fn build_inventory(presentation: &mut Dispatch) -> SlideInventory {
             Err(_) => continue,
         };
 
+        // Shared DISPID cache for all shapes on this slide (same COM class)
+        let shape_dispid_cache = shapes.cache();
+
         for i in 1..=shape_count {
             if let Ok(v) = shapes.call("Item", &[Variant::from(i)]) {
                 if let Ok(d) = v.as_dispatch() {
-                    let shape = Dispatch::new(d);
+                    let shape = Dispatch::new_with_cache(d, shape_dispid_cache.clone());
                     scan_shape_recursive(
                         shape,
                         slide_index,
@@ -242,11 +245,10 @@ fn scan_shape_recursive(
         return;
     }
 
-    // Linked OLE Excel.Sheet
+    // Linked OLE Excel.Sheet — skip HasChart/HasTable checks (OLE is never a chart or table)
     if shape_type == MsoShapeType::LinkedOleObject as i32 {
         if let Ok(lf_variant) = shape.get("LinkFormat") {
             if lf_variant.as_dispatch().is_ok() {
-                // Check ProgID for Excel.Sheet
                 let prog_id = shape.nav("OLEFormat")
                     .and_then(|mut ole| ole.get("ProgID"))
                     .and_then(|v| v.as_string().map_err(|e| e))
@@ -261,6 +263,16 @@ fn scan_shape_recursive(
                 }
             }
         }
+        // delt_ check for non-group OLE shapes still needed
+        if name.contains("delt_") {
+            delt_candidates.push(DeltCandidate {
+                slide_index,
+                dispatch: shape.clone(),
+                name,
+            });
+            inventory.count_delt += 1;
+        }
+        return; // Short-circuit: OLE is never a chart or table shape
     }
 
     // Linked charts
@@ -281,6 +293,7 @@ fn scan_shape_recursive(
                 slide_index,
             });
         }
+        return; // Charts are never tables
     }
 
     // Table shapes

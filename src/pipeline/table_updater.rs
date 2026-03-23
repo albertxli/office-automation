@@ -11,6 +11,10 @@
 //! GOTCHA #16: Use .Text (not .Value2) for display strings from Excel.
 //! Python optimization: skipping formatting on ntbl_/trns_ saves ~232k COM calls.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use crate::com::dispatch::Dispatch;
 use crate::com::variant::Variant;
 use crate::config::Config;
@@ -35,6 +39,12 @@ pub fn update_tables(
     if inventory.ole_shapes.is_empty() {
         return Ok(0);
     }
+
+    // Pre-open workbook and cache worksheets — avoids repeated Worksheets.Item() per table
+    let mut workbooks = Dispatch::new(excel_app.get("Workbooks")?.as_dispatch()?);
+    let mut wb = open_or_get_workbook(&mut workbooks, excel_path)?;
+    let mut sheets_collection = Dispatch::new(wb.get("Worksheets")?.as_dispatch()?);
+    let mut sheet_cache: HashMap<String, Dispatch> = HashMap::new();
 
     let mut count = 0;
 
@@ -72,10 +82,19 @@ pub fn update_tables(
 
         // Use the NEW excel_path (from command line), not the old path from SourceFullName.
         // The sheet name and range still come from SourceFullName.
+        // Get cached worksheet dispatch (or fetch + cache on first access)
+        let sheet = if let Some(cached) = sheet_cache.get(&parts.sheet_name) {
+            cached.clone()
+        } else {
+            let sv = sheets_collection.call("Item", &[Variant::from(parts.sheet_name.as_str())])?;
+            let d = Dispatch::new(sv.as_dispatch()?);
+            sheet_cache.insert(parts.sheet_name.clone(), d.clone());
+            d
+        };
+
         match process_table(
             table_info,
-            excel_path,
-            &parts.sheet_name,
+            sheet,
             &parts.range_address,
             config,
             excel_app,
@@ -106,8 +125,7 @@ pub fn update_tables(
 /// Process a single table: read Excel data and fill PPT table cells.
 fn process_table(
     table_info: &TableInfo,
-    file_path: &str,
-    sheet_name: &str,
+    mut sheet: Dispatch,
     range_address: &str,
     config: &Config,
     excel_app: &mut Dispatch,
@@ -117,14 +135,6 @@ fn process_table(
     // For ntbl_ and trns_: skip all formatting (preserve template formatting)
     // Only htmp_ tables need formatting work
     let skip_formatting = table_info.table_type != TableType::Heatmap;
-
-    // Open workbook and get range
-    let mut workbooks = Dispatch::new(excel_app.get("Workbooks")?.as_dispatch()?);
-    let mut wb = open_or_get_workbook(&mut workbooks, file_path)?;
-    let mut sheets = Dispatch::new(wb.get("Worksheets")?.as_dispatch()?);
-
-    let sheet_variant = sheets.call("Item", &[Variant::from(sheet_name)])?;
-    let mut sheet = Dispatch::new(sheet_variant.as_dispatch()?);
 
     let range_variant = sheet.call("Range", &[Variant::from(range_address)])?;
     let mut cell_range = Dispatch::new(range_variant.as_dispatch()?);
@@ -147,73 +157,108 @@ fn process_table(
 
     let mut cells_dispatch = Dispatch::new(cell_range.get("Cells")?.as_dispatch()?);
 
+    // --- Pass 1: Pre-read ALL Excel data (batch all Excel COM calls together) ---
+    // This improves COM IPC throughput by avoiding context switches between Excel and PPT.
+    let excel_cell_cache = cells_dispatch.cache();
+    let mut excel_texts: Vec<Vec<String>> = Vec::with_capacity(max_rows as usize);
+    // For heatmap: also pre-read formatting data
+    struct HeatmapCell {
+        bg_color: i32,
+        font_name: String,
+        font_size: Variant,
+        font_bold: Variant,
+        font_italic: Variant,
+        font_color: Variant,
+    }
+    let mut heatmap_data: Vec<Vec<Option<HeatmapCell>>> = Vec::new();
+
+    for excel_row in 1..=max_rows {
+        let mut row_texts = Vec::with_capacity(max_cols as usize);
+        let mut row_heatmap = Vec::new();
+        for excel_col in 1..=max_cols {
+            let excel_cell_variant = cells_dispatch.call("Item", &[
+                Variant::from(excel_row), Variant::from(excel_col),
+            ])?;
+            let mut excel_cell = Dispatch::new_with_cache(excel_cell_variant.as_dispatch()?, excel_cell_cache.clone());
+            let cell_text = excel_cell.get("Text")
+                .and_then(|v| v.as_string().map_err(|e| e))
+                .unwrap_or_default();
+            row_texts.push(cell_text);
+
+            if !skip_formatting {
+                let bg_color = excel_cell.nav("DisplayFormat.Interior")
+                    .and_then(|mut int| int.get("Color"))
+                    .and_then(|v| v.as_i32().map_err(|e| e))
+                    .unwrap_or(0);
+                let hc = if let Ok(mut ef) = excel_cell.get("Font")
+                    .and_then(|v| v.as_dispatch().map_err(|e| e))
+                    .map(Dispatch::new)
+                {
+                    Some(HeatmapCell {
+                        bg_color,
+                        font_name: ef.get("Name").and_then(|v| v.as_string().map_err(|e| e)).unwrap_or_default(),
+                        font_size: ef.get("Size").unwrap_or_default(),
+                        font_bold: ef.get("Bold").unwrap_or_default(),
+                        font_italic: ef.get("Italic").unwrap_or_default(),
+                        font_color: ef.get("Color").unwrap_or_default(),
+                    })
+                } else {
+                    None
+                };
+                row_heatmap.push(hc);
+            }
+        }
+        excel_texts.push(row_texts);
+        if !skip_formatting {
+            heatmap_data.push(row_heatmap);
+        }
+    }
+
+    // --- Pass 2: Write ALL PPT cells (no Excel COM calls in this loop) ---
+    let ppt_cell_cache = tbl.cache();
+    let shape_cache: Rc<RefCell<HashMap<String, i32>>> = Rc::new(RefCell::new(HashMap::new()));
+    let tf_cache: Rc<RefCell<HashMap<String, i32>>> = Rc::new(RefCell::new(HashMap::new()));
+    let tr_cache: Rc<RefCell<HashMap<String, i32>>> = Rc::new(RefCell::new(HashMap::new()));
+
     for excel_row in 1..=max_rows {
         for excel_col in 1..=max_cols {
-            // Apply transpose if needed
             let (ppt_row, ppt_col) = if do_transpose {
                 (excel_col, excel_row)
             } else {
                 (excel_row, excel_col)
             };
+            if ppt_row > total_rows || ppt_col > total_cols { continue; }
 
-            // Bounds check
-            if ppt_row > total_rows || ppt_col > total_cols {
-                continue;
-            }
+            let cell_text = &excel_texts[(excel_row - 1) as usize][(excel_col - 1) as usize];
 
-            // Read Excel cell text (GOTCHA #16: .Text preserves formatting)
-            let excel_cell_variant = cells_dispatch.call("Item", &[
-                Variant::from(excel_row),
-                Variant::from(excel_col),
-            ])?;
-            let mut excel_cell = Dispatch::new(excel_cell_variant.as_dispatch()?);
-            let cell_text = excel_cell.get("Text")
-                .and_then(|v| v.as_string().map_err(|e| e))
-                .unwrap_or_default();
-
-            // Get PPT table cell
+            // Write to PPT table cell
             let ppt_cell_variant = tbl.call("Cell", &[
-                Variant::from(ppt_row),
-                Variant::from(ppt_col),
+                Variant::from(ppt_row), Variant::from(ppt_col),
             ])?;
-            let mut ppt_cell = Dispatch::new(ppt_cell_variant.as_dispatch()?);
-
-            // Set cell text — step by step (nav can lose context on some COM objects)
-            let mut cell_shape = Dispatch::new(ppt_cell.get("Shape")?.as_dispatch()?);
-            let mut text_frame = Dispatch::new(cell_shape.get("TextFrame")?.as_dispatch()?);
-            let mut text_range = Dispatch::new(text_frame.get("TextRange")?.as_dispatch()?);
+            let mut ppt_cell = Dispatch::new_with_cache(ppt_cell_variant.as_dispatch()?, ppt_cell_cache.clone());
+            let mut cell_shape = Dispatch::new_with_cache(ppt_cell.get("Shape")?.as_dispatch()?, shape_cache.clone());
+            let mut text_frame = Dispatch::new_with_cache(cell_shape.get("TextFrame")?.as_dispatch()?, tf_cache.clone());
+            let mut text_range = Dispatch::new_with_cache(text_frame.get("TextRange")?.as_dispatch()?, tr_cache.clone());
             text_range.put("Text", Variant::from(cell_text.as_str()))?;
 
-            // For heatmap: copy fill color and font from Excel
+            // Apply heatmap formatting from pre-read data
             if !skip_formatting {
-                // Fill color from Excel's DisplayFormat
-                if let Ok(bg_color) = excel_cell.nav("DisplayFormat.Interior")
-                    .and_then(|mut int| int.get("Color"))
-                    .and_then(|v| v.as_i32().map_err(|e| e))
+                if let Some(Some(hc)) = heatmap_data.get((excel_row - 1) as usize)
+                    .and_then(|row| row.get((excel_col - 1) as usize))
                 {
                     let _ = cell_shape.nav("Fill")
                         .and_then(|mut fill| {
                             fill.call0("Solid")?;
                             fill.nav("ForeColor")
-                                .and_then(|mut fc| fc.put("RGB", Variant::from(bg_color)).map_err(|e| e))
+                                .and_then(|mut fc| fc.put("RGB", Variant::from(hc.bg_color)).map_err(|e| e))
                         });
-                }
-
-                // Font properties from Excel
-                if let Ok(mut excel_font) = excel_cell.get("Font")
-                    .and_then(|v| v.as_dispatch().map_err(|e| e))
-                    .map(Dispatch::new)
-                {
                     if let Ok(mut ppt_font) = cell_shape.nav("TextFrame.TextRange.Font") {
-                        let _ = ppt_font.put("Name", Variant::from(
-                            excel_font.get("Name").and_then(|v| v.as_string().map_err(|e| e)).unwrap_or_default().as_str()
-                        ));
-                        let _ = ppt_font.put("Size", excel_font.get("Size").unwrap_or_default());
-                        let _ = ppt_font.put("Bold", excel_font.get("Bold").unwrap_or_default());
-                        let _ = ppt_font.put("Italic", excel_font.get("Italic").unwrap_or_default());
+                        let _ = ppt_font.put("Name", Variant::from(hc.font_name.as_str()));
+                        let _ = ppt_font.put("Size", hc.font_size.clone());
+                        let _ = ppt_font.put("Bold", hc.font_bold.clone());
+                        let _ = ppt_font.put("Italic", hc.font_italic.clone());
                         let _ = ppt_font.nav("Color").and_then(|mut c| {
-                            let color = excel_font.get("Color").unwrap_or_default();
-                            c.put("RGB", color).map_err(|e| e)
+                            c.put("RGB", hc.font_color.clone()).map_err(|e| e)
                         });
                     }
                 }

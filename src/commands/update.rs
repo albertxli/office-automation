@@ -180,6 +180,31 @@ fn run_com_pipeline(
         }
     }
 
+    // ZIP chart data pre-update: rewrite numCache values directly in chart XML.
+    // This bypasses the slow LinkFormat.Update() COM call.
+    let mut chart_data_ok = false;
+    if !dry_run {
+        let chart_t = std::time::Instant::now();
+        match zip_chart_preupdate(pptx_path, excel_path, &mut excel_app, quiet, verbose) {
+            Ok(result) => {
+                chart_data_ok = result.charts_updated > 0 || result.series_updated == 0;
+                let chart_elapsed = chart_t.elapsed().as_secs_f64();
+                if verbose {
+                    verbose::note(&format!(
+                        "Chart pre-update ··········· {} charts ({} series) · {:.1}s",
+                        result.charts_updated, result.series_updated, chart_elapsed
+                    ));
+                }
+            }
+            Err(e) => {
+                if verbose {
+                    verbose::note(&format!("Chart pre-update skipped: {e}"));
+                }
+                // Fall back to COM-based chart update in pipeline
+            }
+        }
+    }
+
     // Open presentation
     let t_open = std::time::Instant::now();
     let mut presentations = Dispatch::new(ppt_app.get("Presentations")?.as_dispatch()?);
@@ -208,6 +233,7 @@ fn run_com_pipeline(
         steps_skip,
         quiet,
         verbose,
+        chart_data_ok,
     )?;
 
     // Save (unless dry-run)
@@ -309,6 +335,67 @@ fn pick_excel_file() -> OaResult<PathBuf> {
         Some(path) => Ok(path),
         None => Err(OaError::Other("File selection cancelled".into())),
     }
+}
+
+/// ZIP chart data pre-update: scan chart ranges, read values from Excel, rewrite ZIP.
+///
+/// Opens the Excel workbook (via already-open Excel app), reads all chart range values
+/// in batch using Range.Value2 (SAFEARRAY), then rewrites the PPTX chart XML cache.
+fn zip_chart_preupdate(
+    pptx_path: &Path,
+    excel_path: &Path,
+    excel_app: &mut Dispatch,
+    _quiet: bool,
+    _verbose: bool,
+) -> Result<crate::zip_ops::chart_data::ChartDataResult, String> {
+    use crate::zip_ops::chart_data;
+    use crate::pipeline::table_updater::open_or_get_workbook;
+
+    // Step 1: Scan chart XML for range references
+    let chart_ranges = chart_data::scan_chart_ranges(pptx_path)?;
+    if chart_ranges.is_empty() {
+        return Ok(chart_data::ChartDataResult { charts_updated: 0, series_updated: 0 });
+    }
+
+    // Step 2: Collect unique range refs and read values from Excel via COM
+    let unique_ranges = chart_data::collect_unique_ranges(&chart_ranges);
+    if unique_ranges.is_empty() {
+        return Ok(chart_data::ChartDataResult { charts_updated: 0, series_updated: 0 });
+    }
+
+    let excel_str = strip_unc(&excel_path.canonicalize().map_err(|e| e.to_string())?);
+    let mut workbooks = Dispatch::new(
+        excel_app.get("Workbooks").map_err(|e| e.to_string())?
+            .as_dispatch().map_err(|e| e.to_string())?
+    );
+    let mut wb = open_or_get_workbook(&mut workbooks, &excel_str).map_err(|e| e.to_string())?;
+
+    let mut range_values: std::collections::HashMap<String, Vec<f64>> = std::collections::HashMap::new();
+
+    for range_ref in &unique_ranges {
+        // Parse "Sheet!Range" format
+        let (sheet_name, range_addr) = if let Some(pos) = range_ref.find('!') {
+            (range_ref[..pos].to_string(), range_ref[pos + 1..].to_string())
+        } else {
+            ("Tables".to_string(), range_ref.clone())
+        };
+
+        // Read via Range.Value2 (SAFEARRAY batch — one COM call per range)
+        let val = wb.get("Worksheets")
+            .and_then(|v| v.as_dispatch())
+            .and_then(|d| Dispatch::new(d).call("Item", &[Variant::from(sheet_name.as_str())]))
+            .and_then(|v| v.as_dispatch())
+            .and_then(|d| Dispatch::new(d).call("Range", &[Variant::from(range_addr.as_str())]))
+            .and_then(|v| v.as_dispatch())
+            .and_then(|d| Dispatch::new(d).get("Value2"))
+            .map_err(|e| format!("Failed to read range {range_ref}: {e}"))?;
+
+        let values = val.as_flat_f64_vec().map_err(|e| format!("Failed to unpack {range_ref}: {e}"))?;
+        range_values.insert(range_ref.clone(), values);
+    }
+
+    // Step 3: Rewrite chart XML cache in the PPTX ZIP
+    chart_data::update_chart_data(pptx_path, &range_values)
 }
 
 /// Build a comfy-table with our standard style.

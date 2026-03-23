@@ -1,3 +1,4 @@
+pub mod chart_data;
 pub mod detector;
 pub mod relinker;
 pub mod xml_stream;

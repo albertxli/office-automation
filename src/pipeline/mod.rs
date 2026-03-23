@@ -130,6 +130,7 @@ pub fn run_pipeline(
     steps_skip: &[String],
     quiet: bool,
     verbose: bool,
+    skip_chart_refresh: bool,
 ) -> OaResult<PipelineResults> {
     verbose::set_verbose(verbose);
 
@@ -160,7 +161,7 @@ pub fn run_pipeline(
 
     if active_steps.iter().any(|s| s == "charts") {
         run_step!(results, quiet, "Charts", charts_updated,
-            chart_updater::update_charts(inventory, excel_path)?);
+            chart_updater::update_charts(inventory, excel_path, skip_chart_refresh)?);
     }
 
     Ok(results)

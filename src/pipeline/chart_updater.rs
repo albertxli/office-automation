@@ -14,12 +14,15 @@ use crate::shapes::inventory::SlideInventory;
 
 /// Update all linked chart shapes to point to the new Excel file.
 ///
-/// Sets SourceFullName, calls Update() to refresh data, then sets AutoUpdate=Manual.
+/// If `skip_refresh` is true, skips the expensive `LinkFormat.Update()` call because
+/// chart data was already pre-updated in the PPTX ZIP (Tier 1 optimization).
+/// Still sets AutoUpdate=Manual on each chart.
 ///
 /// Returns the count of charts successfully updated.
 pub fn update_charts(
     inventory: &SlideInventory,
     excel_path: &str,
+    skip_refresh: bool,
 ) -> OaResult<usize> {
     if inventory.charts.is_empty() {
         return Ok(0);
@@ -45,23 +48,24 @@ pub fn update_charts(
             continue;
         }
 
-        // Set new source
-        if let Err(e) = link_format.put("SourceFullName", Variant::from(excel_path)) {
-            eprintln!("Warning: failed to set chart SourceFullName for '{}': {e}", chart_ref.name);
-            continue;
+        if skip_refresh {
+            // ZIP pre-update already wrote correct data — just set AutoUpdate
+            let _ = link_format.put("AutoUpdate", Variant::from(PpUpdateOption::Manual as i32));
+            updated += 1;
+            super::verbose::detail(chart_ref.slide_index, &chart_ref.name, "AutoUpdate=Manual (pre-updated)");
+        } else {
+            // Full COM update: set source + refresh data
+            if let Err(e) = link_format.put("SourceFullName", Variant::from(excel_path)) {
+                eprintln!("Warning: failed to set chart SourceFullName for '{}': {e}", chart_ref.name);
+                continue;
+            }
+            if let Err(e) = link_format.call0("Update") {
+                eprintln!("Warning: failed to update chart data for '{}': {e}", chart_ref.name);
+            }
+            let _ = link_format.put("AutoUpdate", Variant::from(PpUpdateOption::Manual as i32));
+            updated += 1;
+            super::verbose::detail(chart_ref.slide_index, &chart_ref.name, "linked + refreshed");
         }
-
-        // Update chart data (charts need this, unlike OLE links)
-        if let Err(e) = link_format.call0("Update") {
-            eprintln!("Warning: failed to update chart data for '{}': {e}", chart_ref.name);
-            // Continue anyway — the source was set even if update failed
-        }
-
-        // Set to manual update
-        let _ = link_format.put("AutoUpdate", Variant::from(PpUpdateOption::Manual as i32));
-
-        updated += 1;
-        super::verbose::detail(chart_ref.slide_index, &chart_ref.name, "linked + refreshed");
     }
 
     Ok(updated)
