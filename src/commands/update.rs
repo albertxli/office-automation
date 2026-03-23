@@ -169,7 +169,12 @@ fn run_com_pipeline(
         let relink_elapsed = relink_t.elapsed().as_secs_f64();
         if let Some(pb) = relink_spinner { pb.finish_and_clear(); }
         if !quiet {
-            println!("{}", pipeline::format_step_line_pub("Relink", relinked, relink_elapsed));
+            if verbose {
+                // Dim detail line, consistent with other overhead lines
+                verbose::note(&format!("Relink ····················· {} links · {:.1}s", relinked, relink_elapsed));
+            } else {
+                println!("{}", pipeline::format_step_line_pub("Relink", relinked, relink_elapsed));
+            }
         }
     }
 

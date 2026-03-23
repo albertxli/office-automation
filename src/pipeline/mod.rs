@@ -110,7 +110,9 @@ macro_rules! run_step {
         if let Some(pb) = spinner {
             pb.finish_and_clear();
         }
-        if !$quiet {
+        // In verbose mode, detail lines already printed — skip the summary dot line.
+        // In normal mode, the dot line IS the output.
+        if !$quiet && !verbose::is_verbose() {
             println!("{}", format_step_line_pub($name, count, elapsed));
         }
         $results.steps.push(StepResult { name: $name, count, elapsed_secs: elapsed, ok: true });
