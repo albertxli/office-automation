@@ -3,5 +3,6 @@ pub mod clean;
 pub mod config_cmd;
 pub mod diff;
 pub mod info;
+pub mod py_parser;
 pub mod run;
 pub mod update;
