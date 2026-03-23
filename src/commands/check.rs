@@ -246,17 +246,20 @@ fn print_check_row(name: &str, checked: usize, series: Option<usize>, mismatches
     let pad = 25usize.saturating_sub(detail_plain.len());
     let detail = format!("{}{}", detail_styled, " ".repeat(pad));
 
-    // Mismatch count: white bold when 0, red when >0
-    let mm_display = if mismatches == 0 {
-        format!("{:>2} {}", s_count.apply_to(0), s_dim.apply_to("mismatches"))
+    // Mismatch column: fixed width (16 chars plain) so PASS/FAIL aligns
+    let mm_plain = format!("{:>3} mismatches", mismatches);
+    let mm_styled = if mismatches == 0 {
+        format!("{:>3} {}", s_count.apply_to(0), s_dim.apply_to("mismatches"))
     } else {
-        format!("{:>2} {}", s_fail.apply_to(mismatches), s_dim.apply_to("mismatches"))
+        format!("{:>3} {}", s_fail.apply_to(mismatches), s_dim.apply_to("mismatches"))
     };
+    let mm_pad = 16usize.saturating_sub(mm_plain.len());
+    let mm_display = format!("{}{}", " ".repeat(mm_pad), mm_styled);
 
     // Badge: PASS or FAIL
     let badge = if mismatches == 0 { s_ok.apply_to("PASS") } else { s_fail.apply_to("FAIL") };
 
-    println!("  {} {} {} {:>3} {}  {}  {}  {}",
+    println!("  {} {} {} {:>3} {}  {} {}  {}",
         icon, name, s_dim.apply_to(&leaders),
         s_count.apply_to(checked), detail,
         s_dim.apply_to("·"), mm_display, badge);
