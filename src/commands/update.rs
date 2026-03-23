@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use colored::Colorize;
+use console::Style;
 
 use crate::cli::{parse_pair, UpdateArgs};
 use crate::com::dispatch::Dispatch;
@@ -56,13 +56,16 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        let s_target = Style::new().cyan();
+        let s_source = Style::new().yellow();
+        let s_dim = Style::new().dim();
+
         if !args.quiet {
             println!();
-            println!("{} {} {} {}",
-                "Processing:".bold(),
-                file_name.cyan(),
-                "<-".dimmed(),
-                excel_name.dimmed());
+            println!("  {} {}", s_target.apply_to("▸"), s_target.apply_to(&file_name));
+            println!("    {} {}", s_source.apply_to("←"), s_source.apply_to(&excel_name));
+            println!("  {}", s_dim.apply_to("╌".repeat(39)));
+            println!();
         }
 
         // Determine output path
@@ -90,7 +93,7 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
                     0
                 });
             if relinked > 0 && !args.quiet {
-                println!("  {} {relinked} links", "ZIP pre-relinked".dimmed());
+                println!("  {} {relinked} links", s_dim.apply_to("ZIP pre-relinked"));
             }
         }
 
@@ -109,12 +112,13 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
             Ok(results) => {
                 let elapsed = start.elapsed().as_secs_f64();
                 if !args.quiet {
-                    print_results_table(&file_name, &excel_name, &results, elapsed, args.dry_run);
+                    print_completion(&results, elapsed, args.dry_run);
                 }
                 all_results.push((file_name, results, elapsed));
             }
             Err(e) => {
-                eprintln!("  {} {e}", "Error:".red().bold());
+                let s_err = Style::new().red().bold();
+                eprintln!("  {} {e}", s_err.apply_to("Error:"));
             }
         }
     }
@@ -122,8 +126,7 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
     // Batch summary
     if pairs.len() > 1 && !args.quiet {
         let total_elapsed = total_start.elapsed().as_secs_f64();
-        println!();
-        print_batch_summary(&all_results, total_elapsed);
+        print_batch_completion(&all_results, total_elapsed);
     }
 
     Ok(())
@@ -284,62 +287,48 @@ fn pick_excel_file() -> OaResult<PathBuf> {
     }
 }
 
-/// Print a nice results table for a single file.
-fn print_results_table(
-    file_name: &str,
-    excel_name: &str,
-    results: &PipelineResults,
-    total_secs: f64,
-    dry_run: bool,
-) {
-    // Step-by-step results
-    for step in &results.steps {
-        let status = if step.ok { "OK".green().bold() } else { "FAIL".red().bold() };
-        println!("  {} {:<12} {:>5}  {}", status, step.name, step.count, format!("({:.1}s)", step.elapsed_secs).dimmed());
-    }
+/// Build a comfy-table with our standard style.
+/// Print the completion line after all steps finish.
+fn print_completion(results: &PipelineResults, total_secs: f64, dry_run: bool) {
+    let s_ok = Style::new().green();
+    let s_count = Style::new().white().bold();
+    let s_dim = Style::new().dim();
 
-    // Summary line
     println!();
     if dry_run {
-        println!("  {} ({total_secs:.1}s)", "Dry run — not saved".yellow().bold());
+        let s_warn = Style::new().yellow();
+        println!("  {} {} {} {} {} {}",
+            s_warn.apply_to("⚠ dry run"),
+            s_dim.apply_to("·"),
+            s_count.apply_to(results.total_objects()),
+            s_dim.apply_to("objects"),
+            s_dim.apply_to("·"),
+            s_warn.apply_to("not saved"));
     } else {
-        println!("  {} <- {} {}", file_name.bold(), excel_name.dimmed(), format!("({total_secs:.1}s)").green());
+        println!("  {} {} {} {} {}",
+            s_ok.apply_to("✓ completed"),
+            s_dim.apply_to("·"),
+            s_count.apply_to(results.total_objects()),
+            s_dim.apply_to("objects ·"),
+            s_ok.apply_to(format!("{total_secs:.1}s")));
     }
-
-    // Summary table
-    println!("  {}", "─".repeat(34).dimmed());
-    println!("  {:<14} {:>5}", "Step".bold(), "Count".bold());
-    println!("  {}", "─".repeat(34).dimmed());
-    for step in &results.steps {
-        if step.count > 0 {
-            println!("  {:<14} {:>5}", step.name, step.count);
-        }
-    }
-    println!("  {}", "─".repeat(34).dimmed());
 }
 
 /// Print batch summary across multiple files.
-fn print_batch_summary(all_results: &[(String, PipelineResults, f64)], total_secs: f64) {
-    println!("{} {} file(s) in {total_secs:.1}s",
-        "Total Summary |".bold(), all_results.len());
-    println!("  {}", "─".repeat(34).dimmed());
-    println!("  {:<14} {:>5}", "Step".bold(), "Total".bold());
-    println!("  {}", "─".repeat(34).dimmed());
+fn print_batch_completion(all_results: &[(String, PipelineResults, f64)], total_secs: f64) {
+    let s_ok = Style::new().green();
+    let s_count = Style::new().white().bold();
+    let s_dim = Style::new().dim();
 
-    let mut totals = [("Links", 0usize), ("Tables", 0), ("Deltas", 0), ("Coloring", 0), ("Charts", 0)];
-    for (_, results, _) in all_results {
-        for step in &results.steps {
-            for (name, total) in &mut totals {
-                if *name == step.name {
-                    *total += step.count;
-                }
-            }
-        }
-    }
-    for (name, total) in &totals {
-        if *total > 0 {
-            println!("  {:<14} {:>5}", name, total);
-        }
-    }
-    println!("  {}", "─".repeat(34).dimmed());
+    let total_objects: usize = all_results.iter().map(|(_, r, _)| r.total_objects()).sum();
+
+    println!();
+    println!("  {} {} {} {} {} {} {}",
+        s_ok.apply_to("✓ batch complete"),
+        s_dim.apply_to("·"),
+        s_count.apply_to(all_results.len()),
+        s_dim.apply_to("files ·"),
+        s_count.apply_to(total_objects),
+        s_dim.apply_to("objects ·"),
+        s_ok.apply_to(format!("{total_secs:.1}s")));
 }

@@ -13,8 +13,9 @@ pub mod delta_updater;
 pub mod linker;
 pub mod table_updater;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::cli::resolve_steps;
@@ -43,17 +44,68 @@ pub struct PipelineResults {
     pub charts_updated: usize,
 }
 
+impl PipelineResults {
+    pub fn total_objects(&self) -> usize {
+        self.steps.iter().map(|s| s.count).sum()
+    }
+}
+
+// ── Styles ──────────────────────────────────────────────────
+fn s_ok() -> Style { Style::new().green() }
+fn s_count() -> Style { Style::new().white().bold() }
+fn s_dim() -> Style { Style::new().dim() }
+
+/// Fixed width for step name + dot leaders (ensures count column aligns).
+const STEP_WIDTH: usize = 30;
+
+/// Format a completed step line:  `● Links ··················· 86   0.0s`
+fn format_step_line(name: &str, count: usize, secs: f64) -> String {
+    let leader_len = STEP_WIDTH.saturating_sub(name.len() + 1);
+    let leaders = "·".repeat(leader_len);
+    format!(
+        "  {} {} {} {:>4}   {}",
+        s_ok().apply_to("•"),
+        name,
+        s_dim().apply_to(&leaders),
+        s_count().apply_to(count),
+        s_dim().apply_to(format!("{secs:.1}s")),
+    )
+}
+
 /// Create a spinner for a pipeline step.
 fn make_spinner(step_name: &str) -> ProgressBar {
+    let leader_len = STEP_WIDTH.saturating_sub(step_name.len() + 1);
+    let leaders = "·".repeat(leader_len);
+    let msg = format!("{step_name} {leaders}");
+
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
             .template("  {spinner:.cyan} {msg}")
             .unwrap()
     );
-    pb.set_message(format!("{step_name}..."));
-    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb.set_message(msg);
+    pb.enable_steady_tick(Duration::from_millis(80));
     pb
+}
+
+/// Run a single pipeline step with spinner.
+macro_rules! run_step {
+    ($results:expr, $quiet:expr, $name:expr, $field:ident, $body:expr) => {{
+        let spinner = if !$quiet { Some(make_spinner($name)) } else { None };
+        let t = Instant::now();
+
+        let count = $body;
+        $results.$field = count;
+
+        let elapsed = t.elapsed().as_secs_f64();
+        if let Some(pb) = spinner {
+            pb.finish_and_clear();
+            println!("{}", format_step_line($name, count, elapsed));
+        }
+        $results.steps.push(StepResult { name: $name, count, elapsed_secs: elapsed, ok: true });
+    }};
 }
 
 /// Run the update pipeline on a presentation with the given steps.
@@ -72,71 +124,29 @@ pub fn run_pipeline(
 
     let mut results = PipelineResults::default();
 
-    // Step 1: Links
     if active_steps.iter().any(|s| s == "links") {
-        let spinner = if !quiet { Some(make_spinner("Links")) } else { None };
-        let t = Instant::now();
-
-        let count = linker::update_links(inventory, excel_path, config)?;
-        results.links_updated = count;
-
-        let elapsed = t.elapsed().as_secs_f64();
-        if let Some(pb) = spinner { pb.finish_and_clear(); }
-        results.steps.push(StepResult { name: "Links", count, elapsed_secs: elapsed, ok: true });
+        run_step!(results, quiet, "Links", links_updated,
+            linker::update_links(inventory, excel_path, config)?);
     }
 
-    // Step 2: Tables
     if active_steps.iter().any(|s| s == "tables") {
-        let spinner = if !quiet { Some(make_spinner("Tables")) } else { None };
-        let t = Instant::now();
-
-        let count = table_updater::update_tables(inventory, config, excel_app, excel_path)?;
-        results.tables_updated = count;
-
-        let elapsed = t.elapsed().as_secs_f64();
-        if let Some(pb) = spinner { pb.finish_and_clear(); }
-        results.steps.push(StepResult { name: "Tables", count, elapsed_secs: elapsed, ok: true });
+        run_step!(results, quiet, "Tables", tables_updated,
+            table_updater::update_tables(inventory, config, excel_app, excel_path)?);
     }
 
-    // Step 3: Deltas
     if active_steps.iter().any(|s| s == "deltas") {
-        let spinner = if !quiet { Some(make_spinner("Deltas")) } else { None };
-        let t = Instant::now();
-
-        let count = delta_updater::update_deltas(
-            inventory, config, presentation, excel_path, excel_app,
-        )?;
-        results.deltas_updated = count;
-
-        let elapsed = t.elapsed().as_secs_f64();
-        if let Some(pb) = spinner { pb.finish_and_clear(); }
-        results.steps.push(StepResult { name: "Deltas", count, elapsed_secs: elapsed, ok: true });
+        run_step!(results, quiet, "Deltas", deltas_updated,
+            delta_updater::update_deltas(inventory, config, presentation, excel_path, excel_app)?);
     }
 
-    // Step 4: Coloring
     if active_steps.iter().any(|s| s == "coloring") {
-        let spinner = if !quiet { Some(make_spinner("Coloring")) } else { None };
-        let t = Instant::now();
-
-        let count = color_coder::apply_color_coding(inventory, config)?;
-        results.tables_colored = count;
-
-        let elapsed = t.elapsed().as_secs_f64();
-        if let Some(pb) = spinner { pb.finish_and_clear(); }
-        results.steps.push(StepResult { name: "Coloring", count, elapsed_secs: elapsed, ok: true });
+        run_step!(results, quiet, "Coloring", tables_colored,
+            color_coder::apply_color_coding(inventory, config)?);
     }
 
-    // Step 5: Charts
     if active_steps.iter().any(|s| s == "charts") {
-        let spinner = if !quiet { Some(make_spinner("Charts")) } else { None };
-        let t = Instant::now();
-
-        let count = chart_updater::update_charts(inventory, excel_path)?;
-        results.charts_updated = count;
-
-        let elapsed = t.elapsed().as_secs_f64();
-        if let Some(pb) = spinner { pb.finish_and_clear(); }
-        results.steps.push(StepResult { name: "Charts", count, elapsed_secs: elapsed, ok: true });
+        run_step!(results, quiet, "Charts", charts_updated,
+            chart_updater::update_charts(inventory, excel_path)?);
     }
 
     Ok(results)

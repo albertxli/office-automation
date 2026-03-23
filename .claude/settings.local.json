@@ -32,7 +32,9 @@
       "WebFetch(domain:nickb.dev)",
       "Bash(uv run:*)",
       "Bash(rm -f output/argentina_perf.pptx)",
-      "Bash(rm -f output/argentina_pretty.pptx)"
+      "Bash(rm -f output/argentina_pretty.pptx)",
+      "Bash(sed 's/.*pub const //')",
+      "Bash(sed 's/:.*//')"
     ]
   }
 }

@@ -829,6 +829,7 @@ dependencies = [
  "bumpalo",
  "clap",
  "colored",
+ "console",
  "enum_dispatch",
  "glob",
  "indicatif",
