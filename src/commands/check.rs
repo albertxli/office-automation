@@ -203,14 +203,26 @@ fn print_check_row(name: &str, checked: usize, series: Option<usize>, mismatches
     let leader_len = 20usize.saturating_sub(name.len());
     let leaders = "·".repeat(leader_len);
 
-    // Detail column: "checked" or "checked (N series)" — fixed width for alignment
-    let detail = match series {
-        Some(n) => format!("{} ({} {})",
-            s_dim.apply_to("checked"),
-            s_count.apply_to(n),
-            s_dim.apply_to("series)")),
-        None => format!("{}                  ", s_dim.apply_to("checked")),
+    // Detail column: "checked" or "checked (N series)" — use plain string for width,
+    // then style it. ANSI escapes break width calculation so we pad manually.
+    let (detail_plain, detail_styled) = match series {
+        Some(n) => {
+            let plain = format!("checked ({n} series)");
+            let styled = format!("{} ({} {}",
+                s_dim.apply_to("checked"),
+                s_count.apply_to(n),
+                s_dim.apply_to("series)"));
+            (plain, styled)
+        }
+        None => {
+            let plain = "checked".to_string();
+            let styled = format!("{}", s_dim.apply_to("checked"));
+            (plain, styled)
+        }
     };
+    // Pad to fixed width (25 chars) for alignment
+    let pad = 25usize.saturating_sub(detail_plain.len());
+    let detail = format!("{}{}", detail_styled, " ".repeat(pad));
 
     // Mismatch count: white bold when 0, red when >0
     let mm_display = if mismatches == 0 {
