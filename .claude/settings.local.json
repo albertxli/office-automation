@@ -36,7 +36,8 @@
       "Bash(sed 's/.*pub const //')",
       "Bash(sed 's/:.*//')",
       "Bash(rm -f output/malaysia_test.pptx)",
-      "Bash(rm -f output/germany_test.pptx)"
+      "Bash(rm -f output/germany_test.pptx)",
+      "Bash(python -c \":*)"
     ]
   }
 }
