@@ -95,11 +95,11 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config) -> 
     let s_target = Style::new().cyan();
     let s_dim = Style::new().dim();
 
-    // Header
+    // Header (wider divider for check — no source file line)
     let file_name = pptx.file_name().unwrap_or_default().to_string_lossy();
     println!();
     println!("  {} {}", s_target.apply_to("▸"), s_target.apply_to(&*file_name));
-    println!("  {}", s_dim.apply_to("╌".repeat(39)));
+    println!("  {}", s_dim.apply_to("╌".repeat(64)));
     println!();
 
     let _com = init_com_sta()?;
@@ -134,18 +134,15 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config) -> 
 
     // Check tables
     check_tables(&inventory, &mut excel_app, &excel_str, config, &mut result);
-    print_check_section("Tables", result.tbl_checked, result.tbl_mismatches.len(),
-        &result.tbl_mismatches, "checked");
+    print_check_row("Tables", result.tbl_checked, None, result.tbl_mismatches.len());
 
     // Check deltas
     check_deltas(&inventory, &mut excel_app, &excel_str, &mut result);
-    print_check_section("Deltas", result.delt_checked, result.delt_mismatches.len(),
-        &result.delt_mismatches, "checked");
+    print_check_row("Deltas", result.delt_checked, None, result.delt_mismatches.len());
 
     // Check charts
     check_charts(&inventory, &mut excel_app, &excel_str, pptx, &mut result);
-    print_check_section("Charts", result.chart_series_checked, result.chart_mismatches.len(),
-        &result.chart_mismatches, "series");
+    print_check_row("Charts", result.chart_count, Some(result.chart_series_checked), result.chart_mismatches.len());
 
     // Cleanup
     drop(inventory);
@@ -166,59 +163,69 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config) -> 
 
     println!();
     if result.passed() {
-        println!("  {} {} {} {} {}",
+        println!("  {} {} {} {} {} {} {} {}",
             s_ok.apply_to("✓ check passed"),
             s_dim.apply_to("·"),
             s_count.apply_to(result.total_checked()),
-            s_dim.apply_to("checked ·"),
+            s_dim.apply_to("checked"),
+            s_dim.apply_to("·"),
+            s_ok.apply_to("0 mismatches"),
+            s_dim.apply_to("·"),
             s_ok.apply_to(format!("{elapsed:.1}s")));
     } else {
-        println!("  {} {} {} {} {} {} {}",
+        println!("  {} {} {} {} {} {} {} {}",
             s_fail.apply_to("✗ check failed"),
             s_dim.apply_to("·"),
-            s_count.apply_to(result.total_mismatches()),
-            s_dim.apply_to("mismatches of"),
             s_count.apply_to(result.total_checked()),
+            s_dim.apply_to("checked"),
             s_dim.apply_to("·"),
-            s_fail.apply_to(format!("{elapsed:.1}s")));
+            s_fail.apply_to(format!("{} mismatches", result.total_mismatches())),
+            s_dim.apply_to("·"),
+            s_ok.apply_to(format!("{elapsed:.1}s")));
     }
 
     Ok(result)
 }
 
-/// Print a section result line + mismatches if any.
-fn print_check_section(name: &str, checked: usize, mismatches: usize, details: &[Mismatch], unit: &str) {
+/// Print a check result row per V3 design spec.
+///
+/// `series` is Some(n) for Charts (shows "checked (N series)"), None for others.
+fn print_check_row(name: &str, checked: usize, series: Option<usize>, mismatches: usize) {
     let s_ok = Style::new().green();
     let s_fail = Style::new().red();
     let s_dim = Style::new().dim();
     let s_count = Style::new().white().bold();
 
-    let leader_len = 28usize.saturating_sub(name.len());
+    // Icon: ✓ or ✗
+    let icon = if mismatches == 0 { s_ok.apply_to("✓") } else { s_fail.apply_to("✗") };
+
+    // Dot leaders (fixed width for name column)
+    let leader_len = 20usize.saturating_sub(name.len());
     let leaders = "·".repeat(leader_len);
 
-    if mismatches == 0 {
-        println!("  {} {} {} {} {} {} {}",
-            s_ok.apply_to("✓"), name, s_dim.apply_to(&leaders),
-            s_count.apply_to(checked), s_dim.apply_to(unit),
-            s_dim.apply_to("·"), s_ok.apply_to("0 mismatches"));
+    // Detail column: "checked" or "checked (N series)" — fixed width for alignment
+    let detail = match series {
+        Some(n) => format!("{} ({} {})",
+            s_dim.apply_to("checked"),
+            s_count.apply_to(n),
+            s_dim.apply_to("series)")),
+        None => format!("{}                  ", s_dim.apply_to("checked")),
+    };
+
+    // Mismatch count: white bold when 0, red when >0
+    let mm_display = if mismatches == 0 {
+        format!("{:>2} {}", s_count.apply_to(0), s_dim.apply_to("mismatches"))
     } else {
-        println!("  {} {} {} {} {} {} {}",
-            s_fail.apply_to("✗"), name, s_dim.apply_to(&leaders),
-            s_count.apply_to(checked), s_dim.apply_to(unit),
-            s_dim.apply_to("·"), s_fail.apply_to(format!("{mismatches} mismatches")));
-        // Show first 10 mismatches
-        for (i, m) in details.iter().enumerate() {
-            if i >= 10 {
-                println!("      {} ... and {} more",
-                    s_dim.apply_to(""),
-                    s_dim.apply_to(details.len() - 10));
-                break;
-            }
-            println!("      {} {:>2} {} {:<24} {}",
-                s_dim.apply_to("Slide"), s_dim.apply_to(m.slide),
-                s_dim.apply_to("│"), s_dim.apply_to(&m.shape), s_dim.apply_to(&m.detail));
-        }
-    }
+        format!("{:>2} {}", s_fail.apply_to(mismatches), s_dim.apply_to("mismatches"))
+    };
+
+    // Badge: PASS or FAIL
+    let badge = if mismatches == 0 { s_ok.apply_to("PASS") } else { s_fail.apply_to("FAIL") };
+
+    println!("  {} {} {} {:>3} {}  {}  {}  {}",
+        icon, name, s_dim.apply_to(&leaders),
+        s_count.apply_to(checked), detail,
+        s_dim.apply_to("·"), mm_display, badge);
 }
 
 // ── Table checking ──────────────────────────────────────────
