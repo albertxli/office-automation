@@ -307,6 +307,20 @@ fn print_completion(results: &PipelineResults, total_secs: f64, dry_run: bool) {
     let s_count = Style::new().white().bold();
     let s_dim = Style::new().dim();
 
+    // In verbose mode, add a divider + per-step summary since detail lines are long
+    if crate::pipeline::verbose::is_verbose() {
+        println!();
+        println!("  {}", s_dim.apply_to("╌".repeat(39)));
+        for step in &results.steps {
+            if step.count > 0 {
+                println!("  {:<14} {:>4}   {}",
+                    step.name,
+                    s_count.apply_to(step.count),
+                    s_dim.apply_to(format!("{:.1}s", step.elapsed_secs)));
+            }
+        }
+    }
+
     println!();
     if dry_run {
         let s_warn = Style::new().yellow();
