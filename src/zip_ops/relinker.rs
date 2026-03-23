@@ -50,6 +50,8 @@ pub fn relink_pptx_zip(pptx_path: &Path, new_excel_path: &Path) -> Result<usize,
     let mut writer = zip::ZipWriter::new(tmp_file);
 
     let mut total_rewritten = 0;
+    let mut chart_files = 0usize;
+    let mut chart_links = 0usize;
 
     for i in 0..reader.len() {
         let mut entry = reader.by_index(i)
@@ -73,9 +75,24 @@ pub fn relink_pptx_zip(pptx_path: &Path, new_excel_path: &Path) -> Result<usize,
                         writer.write_all(&modified_xml)
                             .map_err(|e| format!("Failed to write {name}: {e}"))?;
                         total_rewritten += count;
-                        crate::pipeline::verbose::note(
-                            &format!("{:<42} {} links", name, count)
-                        );
+
+                        // Show per-slide OLE detail, accumulate charts for summary
+                        if name.contains("slides/_rels/") {
+                            // Extract slide number from filename
+                            let label = name
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&name)
+                                .trim_end_matches(".xml.rels")
+                                .replace("slide", "OLE slide ");
+                            crate::pipeline::verbose::note(
+                                &format!("{:<30} {} links", label, count)
+                            );
+                        }
+                        if name.contains("charts/_rels/") {
+                            chart_files += 1;
+                            chart_links += count;
+                        }
                     } else {
                         // No changes — write original
                         writer.start_file(&name, options)
@@ -98,6 +115,13 @@ pub fn relink_pptx_zip(pptx_path: &Path, new_excel_path: &Path) -> Result<usize,
             writer.raw_copy_file(entry)
                 .map_err(|e| format!("Failed to copy {name}: {e}"))?;
         }
+    }
+
+    // Print chart summary (one line instead of 100 individual lines)
+    if chart_files > 0 {
+        crate::pipeline::verbose::note(
+            &format!("Charts ······················· {} links ({} charts)", chart_links, chart_files)
+        );
     }
 
     writer.finish().map_err(|e| format!("Failed to finalize ZIP: {e}"))?;
