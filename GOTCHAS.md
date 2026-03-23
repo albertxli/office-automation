@@ -117,5 +117,8 @@ COM collections (Slides, Shapes, Worksheets, etc.) expose their `Item` indexer a
 ### #34 ZIP Pre-Relink "Access is denied" (os error 5) (Rust-specific)
 `std::fs::rename()` of `.pptx.tmp` over the original PPTX fails with os error 5 when another process has a file handle — typically SynologyDrive sync agent, Windows Search indexer, antivirus, or Explorer preview pane. Common on first run when the PPTX was last modified on another machine (sync agent locks on detecting a new file). On second run the file is stable and rename succeeds. **The fallback is correct by design:** `update.rs` catches the error, prints a warning, and continues with the original PPTX. COM pipeline updates links normally (slower but correct). ZIP pre-relink is a performance optimization, not required for correctness.
 
+### #35 Chart .rels Use Bare Paths (No file:/// Prefix) (Rust-specific)
+OLE link `.rels` in `slides/_rels/` use `file:///C:/path/to/file.xlsx` format. But chart `.rels` in `charts/_rels/` use bare paths: `C:/path/to/file.xlsx` (no `file:///` prefix). The relinker must handle both formats — match and rewrite bare paths as well as `file:///` URIs. Preserve the original format when writing back.
+
 ### #14 Rich Unicode
 Terminal output can use Unicode freely. Earlier cp1252 limitation was a test environment issue only.

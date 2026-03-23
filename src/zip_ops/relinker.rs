@@ -180,7 +180,13 @@ fn rewrite_rels_xml(data: &[u8], new_file_uri: &str) -> Result<(Vec<u8>, usize),
             None => return false,
         };
 
-        if !target.starts_with("file:///") {
+        // Handle two formats:
+        // 1. file:///C:/path/to/file.xlsx  (OLE links in slides/_rels/)
+        // 2. C:/path/to/file.xlsx          (chart links in charts/_rels/ — bare path)
+        let is_file_uri = target.starts_with("file:///");
+        let is_bare_path = !is_file_uri && (target.len() >= 2 && target.as_bytes().get(1) == Some(&b':'));
+
+        if !is_file_uri && !is_bare_path {
             return false;
         }
 
@@ -188,20 +194,28 @@ fn rewrite_rels_xml(data: &[u8], new_file_uri: &str) -> Result<(Vec<u8>, usize),
         let target_normalized = target.replace('\\', "/");
 
         // Split into file path and !sheet!range suffix
-        // We need to be careful with '!' in filenames (Python bug #8)
         let (existing_file_part, suffix) = split_file_uri_and_suffix(&target_normalized);
         let existing_file_normalized = existing_file_part.to_lowercase();
 
+        // For bare paths, compare against the bare path version (strip file:/// from new_file_uri)
+        let new_bare_path = new_file_uri.strip_prefix("file:///").unwrap_or(new_file_uri);
+        let compare_against = if is_bare_path {
+            new_bare_path.replace('\\', "/").to_lowercase()
+        } else {
+            new_file_uri_normalized.clone()
+        };
+
         // Only rewrite if the file part actually differs
-        if existing_file_normalized == new_file_uri_normalized {
+        if existing_file_normalized == compare_against {
             return false;
         }
 
-        // Build new target: new file URI + original suffix
+        // Build new target: preserve the original format (file:/// or bare path)
+        let new_path = if is_bare_path { new_bare_path } else { new_file_uri };
         let new_target = if suffix.is_empty() {
-            new_file_uri.to_string()
+            new_path.to_string()
         } else {
-            format!("{new_file_uri}{suffix}")
+            format!("{new_path}{suffix}")
         };
 
         // Rebuild all attributes, replacing Target
