@@ -51,17 +51,17 @@ fn test_relink_pptx_zip() {
     println!("Original link: {}", original_path.display());
 
     // First relink to Mexico (guaranteed different from whatever it is now)
-    let count = relink_pptx_zip(&tmp_pptx, &excel_target).unwrap();
+    let result = relink_pptx_zip(&tmp_pptx, &excel_target).unwrap();
     // If original was already Mexico, count=0 is OK. Do a second relink to US to guarantee change.
-    if count == 0 {
+    if result.total == 0 {
         let us_excel = test_data_dir().join("rpm_tracking_United_States_(05_07).xlsx");
         if us_excel.exists() {
-            let count2 = relink_pptx_zip(&tmp_pptx, &us_excel).unwrap();
-            assert!(count2 > 0, "Expected at least 1 link rewritten on second attempt");
-            println!("Relinked {count2} links (second pass to US)");
+            let result2 = relink_pptx_zip(&tmp_pptx, &us_excel).unwrap();
+            assert!(result2.total > 0, "Expected at least 1 link rewritten on second attempt");
+            println!("Relinked {} links (second pass to US)", result2.total);
         }
     } else {
-        println!("Relinked {count} links to Mexico");
+        println!("Relinked {} links to Mexico", result.total);
     }
 
     // Verify the link changed from original

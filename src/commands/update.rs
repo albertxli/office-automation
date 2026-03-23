@@ -160,20 +160,22 @@ fn run_com_pipeline(
         let relink_spinner = if use_spinner { Some(pipeline::make_spinner_pub("Relink")) } else { None };
         let relink_t = std::time::Instant::now();
 
-        let relinked = relink_pptx_zip(pptx_path, excel_path)
+        let relink_result = relink_pptx_zip(pptx_path, excel_path)
             .unwrap_or_else(|e| {
                 eprintln!("  ZIP pre-relink warning: {e}");
-                0
+                crate::zip_ops::relinker::RelinkResult { total: 0, ole: 0, charts: 0 }
             });
 
         let relink_elapsed = relink_t.elapsed().as_secs_f64();
         if let Some(pb) = relink_spinner { pb.finish_and_clear(); }
         if !quiet {
             if verbose {
-                // Dim detail line, consistent with other overhead lines
-                verbose::note(&format!("Relink ····················· {} links · {:.1}s", relinked, relink_elapsed));
+                verbose::note(&format!(
+                    "Relink ····················· {} links ({} OLE + {} charts) · {:.1}s",
+                    relink_result.total, relink_result.ole, relink_result.charts, relink_elapsed
+                ));
             } else {
-                println!("{}", pipeline::format_step_line_pub("Relink", relinked, relink_elapsed));
+                println!("{}", pipeline::format_step_line_pub("Relink", relink_result.total, relink_elapsed));
             }
         }
     }

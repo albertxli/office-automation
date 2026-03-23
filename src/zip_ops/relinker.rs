@@ -23,7 +23,14 @@ use crate::zip_ops::xml_stream::rewrite_xml_attributes;
 /// external `file:///` references to `new_excel_path`.
 ///
 /// Returns the number of links rewritten.
-pub fn relink_pptx_zip(pptx_path: &Path, new_excel_path: &Path) -> Result<usize, String> {
+/// Relink result: (total, ole_count, chart_count)
+pub struct RelinkResult {
+    pub total: usize,
+    pub ole: usize,
+    pub charts: usize,
+}
+
+pub fn relink_pptx_zip(pptx_path: &Path, new_excel_path: &Path) -> Result<RelinkResult, String> {
     // Validate inputs
     if !pptx_path.exists() {
         return Err(format!("PPTX file not found: {}", pptx_path.display()));
@@ -50,7 +57,7 @@ pub fn relink_pptx_zip(pptx_path: &Path, new_excel_path: &Path) -> Result<usize,
     let mut writer = zip::ZipWriter::new(tmp_file);
 
     let mut total_rewritten = 0;
-    let mut chart_files = 0usize;
+    let mut ole_links = 0usize;
     let mut chart_links = 0usize;
 
     for i in 0..reader.len() {
@@ -76,21 +83,10 @@ pub fn relink_pptx_zip(pptx_path: &Path, new_excel_path: &Path) -> Result<usize,
                             .map_err(|e| format!("Failed to write {name}: {e}"))?;
                         total_rewritten += count;
 
-                        // Show per-slide OLE detail, accumulate charts for summary
+                        // Track OLE vs chart counts for summary
                         if name.contains("slides/_rels/") {
-                            // Extract slide number from filename
-                            let label = name
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or(&name)
-                                .trim_end_matches(".xml.rels")
-                                .replace("slide", "OLE slide ");
-                            crate::pipeline::verbose::note(
-                                &format!("{:<30} {} links", label, count)
-                            );
-                        }
-                        if name.contains("charts/_rels/") {
-                            chart_files += 1;
+                            ole_links += count;
+                        } else if name.contains("charts/_rels/") {
                             chart_links += count;
                         }
                     } else {
@@ -117,20 +113,6 @@ pub fn relink_pptx_zip(pptx_path: &Path, new_excel_path: &Path) -> Result<usize,
         }
     }
 
-    // Always show chart summary (even if 0 — user wants to see chart count)
-    // Count total chart .rels files in the ZIP (including unchanged ones)
-    let total_chart_files = (0..reader.len())
-        .filter_map(|i| reader.by_index(i).ok())
-        .filter(|e| {
-            let n = e.name().replace('\\', "/");
-            n.ends_with(".rels") && n.contains("charts/_rels/")
-        })
-        .count();
-
-    crate::pipeline::verbose::note(
-        &format!("Charts ······················· {} relinked ({} total)", chart_links, total_chart_files)
-    );
-
     writer.finish().map_err(|e| format!("Failed to finalize ZIP: {e}"))?;
 
     // Replace original with temp
@@ -141,7 +123,7 @@ pub fn relink_pptx_zip(pptx_path: &Path, new_excel_path: &Path) -> Result<usize,
             format!("Failed to replace PPTX: {e}")
         })?;
 
-    Ok(total_rewritten)
+    Ok(RelinkResult { total: total_rewritten, ole: ole_links, charts: chart_links })
 }
 
 /// Check if a ZIP entry is a .rels file in slides/ or charts/.
