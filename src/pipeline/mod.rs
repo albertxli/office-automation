@@ -97,7 +97,10 @@ fn make_spinner(step_name: &str) -> ProgressBar {
 /// Run a single pipeline step with spinner.
 macro_rules! run_step {
     ($results:expr, $quiet:expr, $name:expr, $field:ident, $body:expr) => {{
-        let spinner = if !$quiet { Some(make_spinner($name)) } else { None };
+        // Only show spinner in non-quiet, non-verbose mode.
+        // In verbose mode, detail lines would conflict with the spinner redraw.
+        let use_spinner = !$quiet && !verbose::is_verbose();
+        let spinner = if use_spinner { Some(make_spinner($name)) } else { None };
         let t = Instant::now();
 
         let count = $body;
@@ -106,6 +109,8 @@ macro_rules! run_step {
         let elapsed = t.elapsed().as_secs_f64();
         if let Some(pb) = spinner {
             pb.finish_and_clear();
+        }
+        if !$quiet {
             println!("{}", format_step_line_pub($name, count, elapsed));
         }
         $results.steps.push(StepResult { name: $name, count, elapsed_secs: elapsed, ok: true });
