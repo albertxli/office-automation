@@ -52,9 +52,17 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
         let file_name = pair.pptx.file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default();
+        let excel_name = pair.excel.file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
 
         if !args.quiet {
-            println!("{} {}", "Processing:".bold(), file_name);
+            println!();
+            println!("{} {} {} {}",
+                "Processing:".bold(),
+                file_name.cyan(),
+                "<-".dimmed(),
+                excel_name.dimmed());
         }
 
         // Determine output path
@@ -94,18 +102,14 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
             &args.steps,
             &args.skip,
             args.dry_run,
+            args.quiet,
         );
 
         match result {
             Ok(results) => {
                 let elapsed = start.elapsed().as_secs_f64();
                 if !args.quiet {
-                    print_step_results(&results);
-                    if !args.dry_run {
-                        println!("  {} {elapsed:.1}s", "Done in".green());
-                    } else {
-                        println!("  {} ({elapsed:.1}s)", "Dry run — not saved".yellow());
-                    }
+                    print_results_table(&file_name, &excel_name, &results, elapsed, args.dry_run);
                 }
                 all_results.push((file_name, results, elapsed));
             }
@@ -115,10 +119,11 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
         }
     }
 
-    // Summary
+    // Batch summary
     if pairs.len() > 1 && !args.quiet {
         let total_elapsed = total_start.elapsed().as_secs_f64();
-        println!("\n{} {} files in {total_elapsed:.1}s", "Batch complete:".green().bold(), pairs.len());
+        println!();
+        print_batch_summary(&all_results, total_elapsed);
     }
 
     Ok(())
@@ -132,6 +137,7 @@ fn run_com_pipeline(
     steps_include: &[String],
     steps_skip: &[String],
     dry_run: bool,
+    quiet: bool,
 ) -> OaResult<PipelineResults> {
     let pptx_str = strip_unc(&pptx_path.canonicalize()?);
     let excel_str = strip_unc(&excel_path.canonicalize()?);
@@ -173,6 +179,7 @@ fn run_com_pipeline(
         &excel_str,
         steps_include,
         steps_skip,
+        quiet,
     )?;
 
     // Save (unless dry-run)
@@ -277,20 +284,62 @@ fn pick_excel_file() -> OaResult<PathBuf> {
     }
 }
 
-fn print_step_results(results: &PipelineResults) {
-    if results.links_updated > 0 {
-        println!("  {} {}", "Links:".cyan(), results.links_updated);
+/// Print a nice results table for a single file.
+fn print_results_table(
+    file_name: &str,
+    excel_name: &str,
+    results: &PipelineResults,
+    total_secs: f64,
+    dry_run: bool,
+) {
+    // Step-by-step results
+    for step in &results.steps {
+        let status = if step.ok { "OK".green().bold() } else { "FAIL".red().bold() };
+        println!("  {} {:<12} {:>5}  {}", status, step.name, step.count, format!("({:.1}s)", step.elapsed_secs).dimmed());
     }
-    if results.tables_updated > 0 {
-        println!("  {} {}", "Tables:".cyan(), results.tables_updated);
+
+    // Summary line
+    println!();
+    if dry_run {
+        println!("  {} ({total_secs:.1}s)", "Dry run — not saved".yellow().bold());
+    } else {
+        println!("  {} <- {} {}", file_name.bold(), excel_name.dimmed(), format!("({total_secs:.1}s)").green());
     }
-    if results.deltas_updated > 0 {
-        println!("  {} {}", "Deltas:".cyan(), results.deltas_updated);
+
+    // Summary table
+    println!("  {}", "─".repeat(34).dimmed());
+    println!("  {:<14} {:>5}", "Step".bold(), "Count".bold());
+    println!("  {}", "─".repeat(34).dimmed());
+    for step in &results.steps {
+        if step.count > 0 {
+            println!("  {:<14} {:>5}", step.name, step.count);
+        }
     }
-    if results.tables_colored > 0 {
-        println!("  {} {}", "Coloring:".cyan(), results.tables_colored);
+    println!("  {}", "─".repeat(34).dimmed());
+}
+
+/// Print batch summary across multiple files.
+fn print_batch_summary(all_results: &[(String, PipelineResults, f64)], total_secs: f64) {
+    println!("{} {} file(s) in {total_secs:.1}s",
+        "Total Summary |".bold(), all_results.len());
+    println!("  {}", "─".repeat(34).dimmed());
+    println!("  {:<14} {:>5}", "Step".bold(), "Total".bold());
+    println!("  {}", "─".repeat(34).dimmed());
+
+    let mut totals = [("Links", 0usize), ("Tables", 0), ("Deltas", 0), ("Coloring", 0), ("Charts", 0)];
+    for (_, results, _) in all_results {
+        for step in &results.steps {
+            for (name, total) in &mut totals {
+                if *name == step.name {
+                    *total += step.count;
+                }
+            }
+        }
     }
-    if results.charts_updated > 0 {
-        println!("  {} {}", "Charts:".cyan(), results.charts_updated);
+    for (name, total) in &totals {
+        if *total > 0 {
+            println!("  {:<14} {:>5}", name, total);
+        }
     }
+    println!("  {}", "─".repeat(34).dimmed());
 }
