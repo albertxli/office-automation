@@ -3,10 +3,40 @@
 //! Provides ergonomic conversions for COM automation values.
 
 use windows::core::BSTR;
-use windows::Win32::System::Com::IDispatch;
+use windows::Win32::System::Com::{IDispatch, SAFEARRAY};
+use windows::Win32::System::Ole::{
+    SafeArrayAccessData, SafeArrayGetDim, SafeArrayGetElement, SafeArrayGetLBound,
+    SafeArrayGetUBound, SafeArrayUnaccessData,
+};
 use windows::Win32::System::Variant::*;
 
 use crate::error::{OaError, OaResult};
+
+// VARENUM constants for SAFEARRAY element type detection.
+const VT_ARRAY: u16 = 0x2000;
+const VT_R8: u16 = 5;
+const VT_VARIANT: u16 = 12;
+
+/// A value extracted from a SAFEARRAY element (Range.Value2 or Series.Values).
+#[derive(Debug, Clone)]
+pub enum CellValue {
+    F64(f64),
+    I32(i32),
+    Str(String),
+    Empty,
+}
+
+impl CellValue {
+    /// Convert to f64, treating empty/string as 0.0 (matches Python's chart behavior).
+    pub fn to_f64(&self) -> f64 {
+        match self {
+            CellValue::F64(v) => *v,
+            CellValue::I32(v) => *v as f64,
+            CellValue::Str(s) => s.parse::<f64>().unwrap_or(0.0),
+            CellValue::Empty => 0.0,
+        }
+    }
+}
 
 /// A wrapper around COM VARIANT that provides ergonomic Rust conversions.
 ///
@@ -84,6 +114,155 @@ impl Variant {
     pub fn into_inner(self) -> VARIANT {
         self.0
     }
+
+    /// Check if this variant contains a SAFEARRAY.
+    pub fn is_array(&self) -> bool {
+        self.vt() & VT_ARRAY != 0
+    }
+
+    /// Extract a 1D SAFEARRAY of f64 values (VT_ARRAY|VT_R8).
+    ///
+    /// Used for `Series.Values` which returns chart data points as doubles.
+    /// Uses `SafeArrayAccessData` for zero-copy pointer access.
+    pub fn as_f64_array(&self) -> OaResult<Vec<f64>> {
+        unsafe {
+            let psa = self.safearray_ptr()?;
+            let dims = SafeArrayGetDim(psa);
+            if dims != 1 {
+                return Err(OaError::Other(format!("Expected 1D SAFEARRAY, got {dims}D")));
+            }
+
+            let lb = SafeArrayGetLBound(psa, 1).map_err(OaError::Com)?;
+            let ub = SafeArrayGetUBound(psa, 1).map_err(OaError::Com)?;
+            let count = (ub - lb + 1) as usize;
+            if count == 0 {
+                return Ok(vec![]);
+            }
+
+            let mut data_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            SafeArrayAccessData(psa, &mut data_ptr).map_err(OaError::Com)?;
+
+            // Scope guard: always call UnaccessData even if we panic/error
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let f64_ptr = data_ptr as *const f64;
+                let slice = std::slice::from_raw_parts(f64_ptr, count);
+                slice.to_vec()
+            }));
+
+            SafeArrayUnaccessData(psa).map_err(OaError::Com)?;
+
+            result.map_err(|_| OaError::Other("Panic while reading SAFEARRAY data".into()))
+        }
+    }
+
+    /// Extract a flat Vec<f64> from any numeric VARIANT — scalar or array.
+    ///
+    /// Handles:
+    /// - Scalar (VT_R8, VT_I4, VT_EMPTY) → vec![value]
+    /// - 1D VT_ARRAY|VT_R8 → direct f64 array read
+    /// - 1D/2D VT_ARRAY|VT_VARIANT → per-element extraction, flattened row-by-row
+    pub fn as_flat_f64_vec(&self) -> OaResult<Vec<f64>> {
+        if !self.is_array() {
+            // Scalar: wrap in single-element vec
+            if self.is_empty() {
+                return Ok(vec![0.0]);
+            }
+            return Ok(vec![self.as_numeric()?]);
+        }
+
+        let elem_vt = self.vt() & 0x0FFF;
+
+        if elem_vt == VT_R8 {
+            // Fast path: 1D array of f64 (Series.Values typical case)
+            return self.as_f64_array();
+        }
+
+        if elem_vt == VT_VARIANT {
+            // Slow path: array of VARIANTs (Range.Value2 typical case)
+            return self.as_variant_array_flat();
+        }
+
+        Err(OaError::Other(format!("Unsupported SAFEARRAY element type: VT={elem_vt}")))
+    }
+
+    /// Extract a SAFEARRAY of VARIANTs (1D or 2D), flattened to Vec<f64>.
+    ///
+    /// Range.Value2 returns 2D (rows × cols). Series.Values may return
+    /// VT_ARRAY|VT_VARIANT in some edge cases. Both are handled.
+    fn as_variant_array_flat(&self) -> OaResult<Vec<f64>> {
+        unsafe {
+            let psa = self.safearray_ptr()?;
+            let dims = SafeArrayGetDim(psa);
+
+            match dims {
+                1 => self.read_variant_array_1d(psa),
+                2 => self.read_variant_array_2d(psa),
+                _ => Err(OaError::Other(format!("Unsupported {dims}D SAFEARRAY"))),
+            }
+        }
+    }
+
+    /// Read 1D SAFEARRAY of VARIANTs.
+    unsafe fn read_variant_array_1d(&self, psa: *const SAFEARRAY) -> OaResult<Vec<f64>> {
+        let lb = unsafe { SafeArrayGetLBound(psa, 1).map_err(OaError::Com)? };
+        let ub = unsafe { SafeArrayGetUBound(psa, 1).map_err(OaError::Com)? };
+        let mut values = Vec::with_capacity((ub - lb + 1) as usize);
+
+        for i in lb..=ub {
+            let val = unsafe { self.get_variant_element(psa, &[i])? };
+            values.push(variant_to_f64(&val));
+        }
+        Ok(values)
+    }
+
+    /// Read 2D SAFEARRAY of VARIANTs, flattened row-by-row.
+    ///
+    /// Range.Value2 returns (rows, cols) where dim 1 = rows, dim 2 = cols.
+    unsafe fn read_variant_array_2d(&self, psa: *const SAFEARRAY) -> OaResult<Vec<f64>> {
+        let row_lb = unsafe { SafeArrayGetLBound(psa, 1).map_err(OaError::Com)? };
+        let row_ub = unsafe { SafeArrayGetUBound(psa, 1).map_err(OaError::Com)? };
+        let col_lb = unsafe { SafeArrayGetLBound(psa, 2).map_err(OaError::Com)? };
+        let col_ub = unsafe { SafeArrayGetUBound(psa, 2).map_err(OaError::Com)? };
+
+        let rows = (row_ub - row_lb + 1) as usize;
+        let cols = (col_ub - col_lb + 1) as usize;
+        let mut values = Vec::with_capacity(rows * cols);
+
+        for r in row_lb..=row_ub {
+            for c in col_lb..=col_ub {
+                let val = unsafe { self.get_variant_element(psa, &[r, c])? };
+                values.push(variant_to_f64(&val));
+            }
+        }
+        Ok(values)
+    }
+
+    /// Get a single VARIANT element from a SAFEARRAY by indices.
+    ///
+    /// SafeArrayGetElement copies the element — caller owns the result.
+    unsafe fn get_variant_element(&self, psa: *const SAFEARRAY, indices: &[i32]) -> OaResult<VARIANT> {
+        let mut element = VARIANT::default();
+        unsafe {
+            SafeArrayGetElement(
+                psa,
+                indices.as_ptr(),
+                &mut element as *mut VARIANT as *mut std::ffi::c_void,
+            )
+            .map_err(OaError::Com)?;
+        }
+        Ok(element)
+    }
+
+    /// Get the SAFEARRAY pointer from this VARIANT.
+    ///
+    /// The VARIANT owns the SAFEARRAY — do NOT call SafeArrayDestroy on it.
+    unsafe fn safearray_ptr(&self) -> OaResult<*const SAFEARRAY> {
+        let psa = unsafe { self.0.Anonymous.Anonymous.Anonymous.parray };
+        if psa.is_null() {
+            return Err(OaError::Other("SAFEARRAY pointer is null".into()));
+        }
+        Ok(psa as *const SAFEARRAY)
+    }
 }
 
 // --- From implementations ---
@@ -134,6 +313,22 @@ impl From<VARIANT> for Variant {
     fn from(v: VARIANT) -> Self {
         Self(v)
     }
+}
+
+/// Convert a raw VARIANT element to f64, treating empty/error as 0.0.
+///
+/// Used when unpacking SAFEARRAY elements from Range.Value2.
+fn variant_to_f64(v: &VARIANT) -> f64 {
+    // Try f64 first (most common for numeric data)
+    if let Ok(val) = f64::try_from(v) {
+        return val;
+    }
+    // Try i32 (integer cells)
+    if let Ok(val) = i32::try_from(v) {
+        return val as f64;
+    }
+    // Empty/null/error/string → 0.0 (matches Python: empty cells plot as zero)
+    0.0
 }
 
 impl Default for Variant {
@@ -241,5 +436,42 @@ mod tests {
     fn test_unicode_string() {
         let v = Variant::from("日本語テスト");
         assert_eq!(v.as_string().unwrap(), "日本語テスト");
+    }
+
+    // --- CellValue tests ---
+
+    #[test]
+    fn test_cell_value_f64() {
+        assert!((CellValue::F64(3.14).to_f64() - 3.14).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_cell_value_i32() {
+        assert!((CellValue::I32(42).to_f64() - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_cell_value_str_numeric() {
+        assert!((CellValue::Str("2.5".into()).to_f64() - 2.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_cell_value_str_non_numeric() {
+        assert!((CellValue::Str("N/A".into()).to_f64() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_cell_value_empty() {
+        assert!((CellValue::Empty.to_f64() - 0.0).abs() < f64::EPSILON);
+    }
+
+    // --- is_array tests ---
+
+    #[test]
+    fn test_is_array_false_for_scalars() {
+        assert!(!Variant::from(1i32).is_array());
+        assert!(!Variant::from(1.0f64).is_array());
+        assert!(!Variant::from("hello").is_array());
+        assert!(!Variant::empty().is_array());
     }
 }

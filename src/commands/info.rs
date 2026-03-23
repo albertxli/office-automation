@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use colored::Colorize;
+use console::Style;
 
 use crate::com::dispatch::Dispatch;
 use crate::com::session::{create_instance, init_com_sta, spawn_dialog_dismisser, stop_dialog_dismisser};
@@ -91,47 +91,55 @@ pub fn run_info(pptx_path: &str) -> OaResult<()> {
     stop_dialog_dismisser(stop, handle);
 
     // --- Print results ---
-    println!();
-    println!("{}", "Presentation".bold());
-    println!("  File:   {}", Path::new(pptx_path).file_name().unwrap_or_default().to_string_lossy());
-    println!("  Slides: {slide_count}");
+    let s_cyan = Style::new().cyan();
+    let s_dim = Style::new().dim();
 
+    let file_name = Path::new(pptx_path).file_name().unwrap_or_default().to_string_lossy();
     println!();
-    println!("{}", "OLE Links".bold());
+    println!("  {} {}", s_cyan.apply_to("▸"), s_cyan.apply_to(&*file_name));
+    println!("  {}", s_dim.apply_to("╌".repeat(61)));
+
+    // Slides
+    println!();
+    info_row("Slides", slide_count as usize, false);
+
+    // OLE links
     let total_ole: usize = ole_sources.values().sum();
-    if ole_sources.is_empty() {
-        println!("  {}", "(none)".dimmed());
-    } else {
-        let mut sorted: Vec<_> = ole_sources.iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(a.1));
-        for (src, count) in &sorted {
-            println!("  {:<60} {:>4}", src.dimmed(), count);
-        }
-        println!("  {:<60} {:>4}", "Total".bold(), total_ole);
+    println!();
+    info_row("OLE links", total_ole, false);
+    let mut sorted: Vec<_> = ole_sources.iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(a.1));
+    for (src, count) in &sorted {
+        let display_name = Path::new(src.as_str())
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| src.to_string());
+        info_row(&display_name, **count, true);
     }
 
+    // Charts
+    let total_charts = inventory.charts.len() + unlinked_charts;
     println!();
-    println!("{}", "Charts".bold());
-    println!("  Linked:   {}", inventory.charts.len());
-    println!("  Unlinked: {unlinked_charts}");
+    info_row("Charts", total_charts, false);
+    info_row("Linked", inventory.charts.len(), true);
+    info_row("Unlinked", unlinked_charts, true);
 
+    // Special shapes
+    let total_special = inventory.count_ntbl + inventory.count_htmp
+        + inventory.count_trns + inventory.count_delt + inventory.count_ccst;
     println!();
-    println!("{}", "Special Shapes".bold());
-    println!("  {} {}", "ntbl_ (normal tables):   ".cyan(), inventory.count_ntbl);
-    println!("  {} {}", "htmp_ (heatmap tables):  ".cyan(), inventory.count_htmp);
-    println!("  {} {}", "trns_ (transposed):      ".cyan(), inventory.count_trns);
-    println!("  {} {}", "delt_ (delta indicators):".cyan(), inventory.count_delt);
-    println!("  {} {}", "_ccst (color-coded):     ".cyan(), inventory.count_ccst);
+    info_row("Special shapes", total_special, false);
+    info_row("ntbl_ normal tables", inventory.count_ntbl, true);
+    info_row("htmp_ heatmap tables", inventory.count_htmp, true);
+    info_row("trns_ transposed tables", inventory.count_trns, true);
+    info_row("delt_ delta indicators", inventory.count_delt, true);
+    info_row("_ccst color-coded", inventory.count_ccst, true);
 
+    // Delta templates
     println!();
-    println!("{}", "Delta Templates (Slide 1)".bold());
+    println!("  {}", s_dim.apply_to("Delta templates"));
     for (name, found) in &template_found {
-        let marker = if *found {
-            "\u{2713}".green().to_string()
-        } else {
-            "\u{2717}".red().to_string()
-        };
-        println!("  {name:<30} {marker}");
+        info_row_status(name, *found);
     }
 
     Ok(())
@@ -189,6 +197,46 @@ fn find_template_shape(presentation: &mut Dispatch, name: &str, slide_index: i32
     }
 
     false
+}
+
+/// Print a dot-leader row with right-aligned number.
+///
+/// `indent=true` adds `╰` prefix for sub-items.
+fn info_row(label: &str, count: usize, indent: bool) {
+    let s_dim = Style::new().dim();
+    let s_count = Style::new().white().bold();
+    let prefix = if indent { "    ╰ " } else { "  " };
+    let target_col: usize = 48;
+
+    // Use char count (not byte count) — ╰ is 3 bytes but 1 display char
+    let display_len = prefix.chars().count() + label.chars().count() + 1; // +1 for trailing space
+    let leader_len = target_col.saturating_sub(display_len);
+    let padded = format!("{prefix}{label} {}", "·".repeat(leader_len));
+
+    println!("{} {:>4}",
+        s_dim.apply_to(&padded),
+        s_count.apply_to(count));
+}
+
+/// Print a dot-leader row with ✓/✗ status instead of a number.
+fn info_row_status(label: &str, found: bool) {
+    let s_dim = Style::new().dim();
+    let prefix = "    ╰ ";
+    let target_col: usize = 48;
+
+    let display_len = prefix.chars().count() + label.chars().count() + 1;
+    let leader_len = target_col.saturating_sub(display_len);
+    let padded = format!("{prefix}{label} {}", "·".repeat(leader_len));
+
+    let icon = if found {
+        Style::new().green().apply_to("✓")
+    } else {
+        Style::new().red().apply_to("✗")
+    };
+
+    println!("{}    {}",
+        s_dim.apply_to(&padded),
+        icon);
 }
 
 /// Count unlinked charts in the presentation.

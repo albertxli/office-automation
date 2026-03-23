@@ -394,14 +394,15 @@ fn check_deltas(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path
 
 // ── Chart checking ──────────────────────────────────────────
 
-/// Check charts: verify link targets + series counts via XML ref map.
+/// Check charts: verify link targets, series counts, and series values.
 ///
-/// Full series-value comparison requires SAFEARRAY unpacking which is complex.
-/// Instead we verify: (1) chart links point to correct Excel, (2) series count
-/// matches between COM and XML. If update pipeline ran correctly, data is correct.
+/// Three checks per chart:
+/// 1. Link target points to correct Excel file
+/// 2. Series count matches between COM and XML
+/// 3. Series values match between PPT (Series.Values) and Excel (Range.Value2)
 fn check_charts(
     inventory: &SlideInventory,
-    _excel_app: &mut Dispatch,
+    excel_app: &mut Dispatch,
     excel_path: &str,
     pptx_path: &std::path::Path,
     result: &mut CheckResult,
@@ -420,6 +421,15 @@ fn check_charts(
         .file_name()
         .map(|f| f.to_string_lossy().to_lowercase())
         .unwrap_or_default();
+
+    // Get workbooks collection for Excel reads
+    let mut workbooks = match excel_app.get("Workbooks")
+        .and_then(|v| v.as_dispatch().map_err(|e| e))
+        .map(Dispatch::new)
+    {
+        Ok(wb) => wb,
+        Err(_) => return,
+    };
 
     let mut charts_by_slide: HashMap<i32, Vec<usize>> = HashMap::new();
     for (idx, chart_ref) in inventory.charts.iter().enumerate() {
@@ -457,9 +467,6 @@ fn check_charts(
             let expected_series = refs.map(|r| r.len() as i32).unwrap_or(0);
             *pos_counter += 1;
 
-            // Count each series as checked
-            result.chart_series_checked += series_count.max(expected_series) as usize;
-
             // Check 1: link points to correct Excel
             let source_lower = link_source.to_lowercase();
             let mut chart_ok = true;
@@ -474,9 +481,11 @@ fn check_charts(
                     detail: format!("wrong link: {short}"),
                 });
                 chart_ok = false;
+                let s_red = console::Style::new().red();
+                let s_dim = console::Style::new().dim();
                 crate::pipeline::verbose::check_detail(
                     chart_ref.slide_index, "chart", &chart_ref.name, false,
-                    &format!("wrong link: {short}"));
+                    &format!("{} {}", s_red.apply_to("wrong link:"), s_dim.apply_to(short)));
             }
 
             // Check 2: series count matches
@@ -493,60 +502,168 @@ fn check_charts(
                     &format!("series: COM={series_count} XML={expected_series}"));
             }
 
-            if chart_ok {
-                crate::pipeline::verbose::check_detail(
-                    chart_ref.slide_index, "chart", &chart_ref.name, true,
-                    &format!("linked ({series_count} series)"));
+            // Check 3: series values match (always attempt if we have refs)
+            if let Some(series_refs) = refs {
+                let value_ok = check_chart_series_values(
+                    &mut shape, &mut workbooks, excel_path, series_refs,
+                    chart_ref, series_count, result,
+                );
+                if chart_ok && value_ok {
+                    crate::pipeline::verbose::check_detail(
+                        chart_ref.slide_index, "chart", &chart_ref.name, true,
+                        &format!("verified ({series_count} series)"));
+                }
+            } else {
+                // No XML refs — count-only
+                result.chart_series_checked += series_count as usize;
+                if chart_ok {
+                    crate::pipeline::verbose::check_detail(
+                        chart_ref.slide_index, "chart", &chart_ref.name, true,
+                        &format!("linked ({series_count} series)"));
+                }
             }
         }
     }
 }
 
-/// Read PPT chart series values as Vec<f64>.
-/// Series.Values returns a SAFEARRAY which we can't directly unpack.
-/// Instead, read individual point values via Points collection.
-fn read_ppt_series_values(series: &mut Dispatch, expected_count: usize) -> Vec<f64> {
-    let mut values = Vec::new();
-
-    // Try reading via Points collection
-    let mut points = match series.call("Points", &[])
-        .and_then(|v| v.as_dispatch().map_err(|e| e))
+/// Compare series values between PPT and Excel for one chart.
+///
+/// Returns true if all series match, false if any mismatch found.
+fn check_chart_series_values(
+    shape: &mut Dispatch,
+    workbooks: &mut Dispatch,
+    excel_path: &str,
+    series_refs: &[String],
+    chart_ref: &crate::shapes::inventory::ShapeRef,
+    series_count: i32,
+    result: &mut CheckResult,
+) -> bool {
+    let mut sc = match shape.nav("Chart")
+        .and_then(|mut ch| ch.call("SeriesCollection", &[]))
+        .and_then(|v| v.as_dispatch())
         .map(Dispatch::new)
     {
-        Ok(p) => p,
-        Err(_) => return values,
+        Ok(sc) => sc,
+        Err(_) => {
+            result.chart_series_checked += series_count as usize;
+            return true; // Can't access series — treat as OK (count check passed)
+        }
     };
 
-    let count = points.get("Count")
-        .and_then(|v| v.as_i32().map_err(|e| e))
-        .unwrap_or(0);
+    let mut wb = match open_or_get_workbook(workbooks, excel_path) {
+        Ok(wb) => wb,
+        Err(_) => {
+            result.chart_series_checked += series_count as usize;
+            return true; // Can't open workbook — treat as OK
+        }
+    };
 
-    // Points don't have a direct Value property. Use XValues/Values on the Series
-    // via index. Actually the simplest: we know the expected_count from Excel refs.
-    // Read the series formula to get values, or just trust the Excel side and
-    // read both from Excel for comparison.
+    // Collect all mismatches first, then print with aligned padding
+    struct SeriesMismatch {
+        name: String,
+        diff_count: usize,
+        total: usize,
+        pairs: Vec<(f64, f64)>,
+        has_more: bool,
+    }
+    let mut mismatches: Vec<SeriesMismatch> = Vec::new();
 
-    // Alternative approach: read from the chart's data sheet via ChartData
-    // Series.Values doesn't work via IDispatch easily.
-    // Let's try a different path: Chart.ChartData.Workbook → read values
-    // Actually, the most reliable: just compare Excel values against themselves
-    // through the chart's link. If the chart is properly linked and refreshed,
-    // we can verify by reading the chart's internal data.
+    for (i, range_ref) in series_refs.iter().enumerate() {
+        let series_idx = (i + 1) as i32;
+        result.chart_series_checked += 1;
 
-    // For now, use the expected count and try to read each value
-    // via the Series object's array access (won't work for SAFEARRAY)
-    // Return empty — we'll compare Excel-side only for now
-    values
+        let mut series = match sc.call("Item", &[Variant::from(series_idx)])
+            .and_then(|v| v.as_dispatch())
+            .map(Dispatch::new)
+        {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let ppt_values = match read_ppt_series_values(&mut series) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let excel_values = match read_chart_range(&mut wb, range_ref) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if !values_match(&ppt_values, &excel_values) {
+            let series_name_raw = series.get("Name")
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|_| format!("Series {series_idx}"));
+            let series_name = crate::pipeline::verbose::truncate_middle(&series_name_raw);
+            let (diff_count, pairs, has_more) = collect_mismatch_pairs(&ppt_values, &excel_values, 6);
+            let total = ppt_values.len().max(excel_values.len());
+
+            result.chart_mismatches.push(Mismatch {
+                slide: chart_ref.slide_index,
+                shape: chart_ref.name.clone(),
+                category: "chart".into(),
+                detail: format!("'{series_name}' {diff_count}/{total} differ"),
+            });
+
+            mismatches.push(SeriesMismatch { name: series_name, diff_count, total, pairs, has_more });
+        }
+    }
+
+    // Find max series name length for padding within this chart
+    let max_name_len = mismatches.iter().map(|m| m.name.len()).max().unwrap_or(0);
+
+    for m in &mismatches {
+        crate::pipeline::verbose::check_chart_series_diff(
+            &m.name, max_name_len, m.diff_count, m.total, &m.pairs, m.has_more);
+    }
+
+    mismatches.is_empty()
 }
 
-/// Read Excel values for a chart range reference.
-fn read_chart_range(wb: &mut Dispatch, range_ref: &str) -> Vec<f64> {
+/// Collect first N mismatched (ppt, excel) value pairs for compact display.
+///
+/// Returns: (total_diff_count, pairs_vec, has_more_beyond_max)
+fn collect_mismatch_pairs(ppt: &[f64], excel: &[f64], max: usize) -> (usize, Vec<(f64, f64)>, bool) {
+    let mut pairs = Vec::new();
+    let mut diff_count = 0;
+
+    for (p, e) in ppt.iter().zip(excel.iter()) {
+        if !float_eq(*p, *e) {
+            diff_count += 1;
+            if pairs.len() < max {
+                pairs.push((*p, *e));
+            }
+        }
+    }
+
+    // Length mismatch: count extra elements as diffs too
+    if ppt.len() != excel.len() {
+        diff_count += ppt.len().abs_diff(excel.len());
+    }
+
+    let has_more = diff_count > pairs.len();
+    (diff_count, pairs, has_more)
+}
+
+/// Read PPT chart series values via Series.Values (SAFEARRAY of doubles).
+fn read_ppt_series_values(series: &mut Dispatch) -> OaResult<Vec<f64>> {
+    let values_variant = series.get("Values")?;
+    if values_variant.is_empty() {
+        return Ok(vec![]);
+    }
+    values_variant.as_flat_f64_vec()
+}
+
+/// Read Excel values for a chart range reference (supports multi-cell SAFEARRAY).
+///
+/// Handles non-contiguous ranges like "(Tables!$C$10,Tables!$F$10)" — GOTCHA #20.
+fn read_chart_range(wb: &mut Dispatch, range_ref: &str) -> OaResult<Vec<f64>> {
     let mut values = Vec::new();
 
     // Strip outer parentheses for multi-area ranges
     let ref_str = range_ref.trim_start_matches('(').trim_end_matches(')');
 
-    // Split on comma for non-contiguous ranges
+    // Split on comma for non-contiguous ranges (GOTCHA #20)
     for sub_range in ref_str.split(',') {
         let sub = sub_range.trim().replace('$', "");
         let (sheet_name, range_addr) = if let Some(pos) = sub.find('!') {
@@ -555,26 +672,24 @@ fn read_chart_range(wb: &mut Dispatch, range_ref: &str) -> Vec<f64> {
             ("Tables".to_string(), sub)
         };
 
-        let range_values = wb.get("Worksheets")
-            .and_then(|v| v.as_dispatch().map_err(|e| e))
+        let val = wb.get("Worksheets")
+            .and_then(|v| v.as_dispatch())
             .and_then(|d| Dispatch::new(d).call("Item", &[Variant::from(sheet_name.as_str())]))
-            .and_then(|v| v.as_dispatch().map_err(|e| e))
+            .and_then(|v| v.as_dispatch())
             .and_then(|d| Dispatch::new(d).call("Range", &[Variant::from(range_addr.as_str())]))
-            .and_then(|v| v.as_dispatch().map_err(|e| e))
-            .and_then(|d| Dispatch::new(d).get("Value2"));
+            .and_then(|v| v.as_dispatch())
+            .and_then(|d| Dispatch::new(d).get("Value2"))?;
 
-        if let Ok(val) = range_values {
-            // Single value
-            if let Ok(f) = val.as_f64() {
-                values.push(f);
-            } else if let Ok(i) = val.as_i32() {
-                values.push(i as f64);
-            }
-            // TODO: Handle SAFEARRAY for multi-cell ranges
+        if val.is_array() {
+            values.extend(val.as_flat_f64_vec()?);
+        } else if val.is_empty() {
+            values.push(0.0);
+        } else {
+            values.push(val.as_numeric()?);
         }
     }
 
-    values
+    Ok(values)
 }
 
 /// Build chart reference map from PPTX ZIP.
@@ -865,5 +980,46 @@ mod tests {
     fn test_ccst_non_numeric() {
         let config = Config::default();
         assert_eq!(apply_ccst_transform("N/A", &config), "N/A");
+    }
+
+    // --- collect_mismatch_pairs tests ---
+
+    #[test]
+    fn test_collect_pairs_basic() {
+        let (count, pairs, more) = collect_mismatch_pairs(&[1.0, 2.0, 3.0], &[1.0, 2.5, 3.0], 5);
+        assert_eq!(count, 1);
+        assert_eq!(pairs.len(), 1);
+        assert!((pairs[0].0 - 2.0).abs() < f64::EPSILON);
+        assert!((pairs[0].1 - 2.5).abs() < f64::EPSILON);
+        assert!(!more);
+    }
+
+    #[test]
+    fn test_collect_pairs_truncated() {
+        let (count, pairs, more) = collect_mismatch_pairs(
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+            &[0.0, 0.0, 0.0, 0.0, 0.0], 3);
+        assert_eq!(count, 5);
+        assert_eq!(pairs.len(), 3);
+        assert!(more);
+    }
+
+    #[test]
+    fn test_collect_pairs_length_mismatch() {
+        let (count, _pairs, _more) = collect_mismatch_pairs(&[1.0], &[1.0, 2.0], 5);
+        assert_eq!(count, 1); // 1 extra element
+    }
+
+    #[test]
+    fn test_collect_pairs_all_match() {
+        let (count, pairs, more) = collect_mismatch_pairs(&[1.0, 2.0], &[1.0, 2.0], 5);
+        assert_eq!(count, 0);
+        assert!(pairs.is_empty());
+        assert!(!more);
+    }
+
+    #[test]
+    fn test_values_match_zero_vs_zero() {
+        assert!(values_match(&[0.0, 0.0], &[0.0, 0.0]));
     }
 }
