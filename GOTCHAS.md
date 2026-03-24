@@ -124,6 +124,13 @@ Some charts have `<c:numCache>` with `<c:ptCount val="N"/>` but **zero `<c:pt>` 
 
 **Impact on oa check:** Reading cached values from ZIP returns an empty Vec for these series. Comparing `[]` vs `[0.74]` from Excel reports a false mismatch. **Fix:** Skip comparison when cached values are empty (the chart data is unverifiable from the ZIP cache alone).
 
+### #37 Partial Chart numCache (ptCount > Number of pt Elements) (Rust-specific)
+Some charts have `<c:numCache>` with `<c:ptCount val="3"/>` but only 2 `<c:pt>` elements — a partial cache. This happens with multi-series/multi-column charts where the latest wave or year column hasn't been populated yet (e.g., a 3-column chart for 2023/2024/2025 where 2025 data isn't collected yet).
+
+**Impact on oa update:** The ZIP chart data pre-update replaces existing `<c:pt>` values but didn't create the missing trailing ones. **Fix:** Track `max_pt_idx_seen` during cache traversal. On `</c:numCache>`, inject any remaining values from `max_pt_idx_seen` to `vals.len()`. This scales dynamically for any number of columns/series.
+
+**Impact on oa check:** The ZIP cache has fewer values than Excel, causing `1/N differ` mismatches on the missing column. **Fix:** Same injection in oa update ensures the cache is complete.
+
 ### #35 Chart .rels Use Bare Paths (No file:/// Prefix) (Rust-specific)
 OLE link `.rels` in `slides/_rels/` use `file:///C:/path/to/file.xlsx` format. But chart `.rels` in `charts/_rels/` use bare paths: `C:/path/to/file.xlsx` (no `file:///` prefix). The relinker must handle both formats — match and rewrite bare paths as well as `file:///` URIs. Preserve the original format when writing back.
 
