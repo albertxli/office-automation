@@ -27,6 +27,12 @@ After crashes, `POWERPNT.EXE` and `EXCEL.EXE` zombies persist. The `oa clean` co
 ### #21 Excel.Quit() Hangs (60 seconds!)
 If `IDispatch` references from inventory/shapes still exist when `Application.Quit()` is called, the process hangs for ~60 seconds waiting for RPC disconnection. **Solution:** Explicitly drop all shape/inventory references BEFORE calling Quit. Drop order: inventory → presentation → Excel quit → PPT quit.
 
+### #40 PowerPoint is Single-Instance COM Server (Rust-specific)
+Unlike Excel, PowerPoint registers as a single-instance COM server. All calls to `CoCreateInstance("PowerPoint.Application")` — even from separate threads with separate STA apartments — return the same POWERPNT.EXE process. This means multi-threaded COM parallelism gives zero speedup for PowerPoint operations. Tested: 4 workers with 26 jobs showed 4 Excel processes but only 1 PowerPoint process, with per-job time 4x slower (22s vs 6s) due to COM call serialization through the single process. **Lesson:** Focus on per-job optimization rather than parallelism.
+
+### #41 OLE .rels Ranges Can Be Stale (Rust-specific)
+The `Target` attribute in `ppt/slides/_rels/slide*.xml.rels` stores the original file path + sheet + range from when the template was created. After ZIP pre-relink rewrites the file path, the sheet and range parts remain from the original author's data. These ranges may not match what COM's `LinkFormat.SourceFullName` returns at runtime. **Never use .rels ranges as the authoritative source for Excel data reads** — always use COM's `SourceFullName` for the correct sheet and range.
+
 ### #39 Rapid COM Create/Destroy Causes 0x80010001 (Rust-specific)
 In batch mode (`oa run` with 26 jobs), calling `Application.Quit()` then immediately `CoCreateInstance` for the next job causes `0x80010001 (RPC_E_CALL_REJECTED)` — the previous process hasn't fully shut down yet. Each COM create/destroy cycle also costs ~1.1s (26 jobs = ~28.6s wasted). **Solution:** `ComSession` struct in `com/session.rs` — create Excel + PowerPoint apps once, reuse across all jobs, only `Quit()` at the end. Between jobs: close presentation + close workbooks, but keep apps alive.
 
