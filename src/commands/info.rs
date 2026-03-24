@@ -446,32 +446,50 @@ fn print_per_slide_breakdown(per_slide: &[SlideBreakdown], total_slides: i32) {
     let s_dim = Style::new().dim();
     let s_count = Style::new().white().bold();
 
-    let divider = "╌".repeat(70);
+    // Use exactly {:>6} for every column — header and data use the same format
+    let divider = "╌".repeat(60);
 
     println!();
     println!("  {}", s_dim.apply_to("Per-slide breakdown"));
     println!("  {}", s_dim.apply_to(&divider));
-    println!("  {}",
-        s_dim.apply_to("  slide    ole  chart   ntbl   htmp   trns   delt   ccst  total"));
+
+    // Header row — same {:>6} format as data rows
+    println!("  {} {} {} {} {} {} {} {} {}",
+        s_dim.apply_to(format!("{:>6}", "slide")),
+        s_dim.apply_to(format!("{:>6}", "ole")),
+        s_dim.apply_to(format!("{:>6}", "chart")),
+        s_dim.apply_to(format!("{:>6}", "ntbl")),
+        s_dim.apply_to(format!("{:>6}", "htmp")),
+        s_dim.apply_to(format!("{:>6}", "trns")),
+        s_dim.apply_to(format!("{:>6}", "delt")),
+        s_dim.apply_to(format!("{:>6}", "ccst")),
+        s_dim.apply_to(format!("{:>6}", "total")),
+    );
     println!();
 
     let mut active = 0usize;
     for row in per_slide {
         let total = row.total();
-        if total == 0 { continue; }
-        active += 1;
+        if total > 0 { active += 1; }
 
-        print!("  ");
-        print!("{}", s_dim.apply_to(format!("{:>6}", row.slide)));
-        print_cell(row.ole, &s_dim, &s_count);
-        print_cell(row.chart, &s_dim, &s_count);
-        print_cell(row.ntbl, &s_dim, &s_count);
-        print_cell(row.htmp, &s_dim, &s_count);
-        print_cell(row.trns, &s_dim, &s_count);
-        print_cell(row.delt, &s_dim, &s_count);
-        print_cell(row.ccst, &s_dim, &s_count);
-        print!("  {}", s_count.apply_to(format!("{:>4}", total)));
-        println!();
+        // Show ALL slides — empty slides get dots in every column
+        let total_cell = if total == 0 {
+            format!("{}", s_dim.apply_to(format!("{:>6}", "·")))
+        } else {
+            format!("{}", s_count.apply_to(format!("{:>6}", total)))
+        };
+
+        println!("  {} {} {} {} {} {} {} {} {}",
+            s_dim.apply_to(format!("{:>6}", row.slide)),
+            fmt_cell(row.ole, &s_dim, &s_count),
+            fmt_cell(row.chart, &s_dim, &s_count),
+            fmt_cell(row.ntbl, &s_dim, &s_count),
+            fmt_cell(row.htmp, &s_dim, &s_count),
+            fmt_cell(row.trns, &s_dim, &s_count),
+            fmt_cell(row.delt, &s_dim, &s_count),
+            fmt_cell(row.ccst, &s_dim, &s_count),
+            total_cell,
+        );
     }
 
     let empty = total_slides as usize - active;
@@ -486,11 +504,11 @@ fn print_per_slide_breakdown(per_slide: &[SlideBreakdown], total_slides: i32) {
     );
 }
 
-/// Print a single cell in the per-slide table.
-fn print_cell(value: usize, s_dim: &Style, s_count: &Style) {
+/// Format a single cell in the per-slide table: {:>6} aligned.
+fn fmt_cell(value: usize, s_dim: &Style, s_count: &Style) -> String {
     if value == 0 {
-        print!("{}", s_dim.apply_to(format!("{:>6}", "·")));
+        format!("{}", s_dim.apply_to(format!("{:>6}", "·")))
     } else {
-        print!("{}", s_count.apply_to(format!("{:>6}", value)));
+        format!("{}", s_count.apply_to(format!("{:>6}", value)))
     }
 }
