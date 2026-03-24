@@ -2,6 +2,23 @@
 //!
 //! Supports both .toml and .py runfiles (auto-detected by extension).
 //! Python parser is in `py_parser.rs`.
+//!
+//! TOML format (v2):
+//! ```toml
+//! [templates]
+//! t1 = "template_1.pptx"
+//!
+//! data_path = "../excel_data"          # optional — prepended to job data paths
+//! default_output = "output/{name}.pptx" # optional — {name} replaced with job name
+//! # steps = ["links", "tables"]        # optional — omit to run all
+//! # [config]                           # optional — config overrides
+//!
+//! [[job]]
+//! name = "Argentina"
+//! template = "t1"                       # alias from [templates] or direct path
+//! data = "rpm_tracking_Argentina.xlsx"  # filename (data_path prepended) or full path
+//! # output = "custom/argentina.pptx"   # optional — overrides default_output
+//! ```
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,19 +29,44 @@ use crate::cli::UpdateArgs;
 use crate::commands::update::run_update;
 use crate::error::{OaError, OaResult};
 
-/// Parsed runfile (from TOML or Python).
+/// Parsed runfile (TOML v2 format).
 #[derive(Debug, Deserialize)]
 pub struct RunFile {
+    /// Template aliases: `[templates]` section mapping short names to paths.
+    #[serde(default)]
+    pub templates: HashMap<String, String>,
+    /// Prepended to relative job `data` paths. Optional.
+    #[serde(default)]
+    pub data_path: Option<String>,
+    /// Output path template. `{name}` replaced with job name. Optional.
     #[serde(default)]
     pub default_output: Option<String>,
+    /// Pipeline steps to run. Optional — omit to run all.
     #[serde(default)]
     pub steps: Option<Vec<String>>,
+    /// Config overrides (`[config]` section). Optional.
     #[serde(default)]
     pub config: HashMap<String, toml::Value>,
-    pub jobs: HashMap<String, HashMap<String, JobValue>>,
+    /// Job list (`[[job]]` array). At least one required.
+    #[serde(default)]
+    pub job: Vec<Job>,
+
+    // --- Legacy format support (old [jobs."template"] style) ---
+    #[serde(default)]
+    pub jobs: Option<HashMap<String, HashMap<String, JobValue>>>,
 }
 
-/// A job value: either a plain Excel path string, or a table with `data` + optional `output`.
+/// A single job entry from `[[job]]`.
+#[derive(Debug, Deserialize)]
+pub struct Job {
+    pub name: String,
+    pub template: String,
+    pub data: String,
+    #[serde(default)]
+    pub output: Option<String>,
+}
+
+/// Legacy job value (old format): either a plain string or `{data, output}`.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum JobValue {
@@ -129,8 +171,71 @@ pub fn run_runfile(
 }
 
 fn resolve_jobs(runfile: &RunFile, base_dir: &Path) -> OaResult<Vec<ResolvedJob>> {
+    // New v2 format: [[job]] array
+    if !runfile.job.is_empty() {
+        return resolve_jobs_v2(runfile, base_dir);
+    }
+
+    // Legacy format: [jobs."template_path"]
+    if let Some(ref jobs_map) = runfile.jobs {
+        return resolve_jobs_legacy(runfile, jobs_map, base_dir);
+    }
+
+    Ok(vec![])
+}
+
+/// Resolve jobs from new v2 `[[job]]` format.
+fn resolve_jobs_v2(runfile: &RunFile, base_dir: &Path) -> OaResult<Vec<ResolvedJob>> {
     let mut jobs = Vec::new();
-    for (template_path, job_map) in &runfile.jobs {
+
+    for job in &runfile.job {
+        // Resolve template: check aliases first, then use as path
+        let template_path = runfile.templates.get(&job.template)
+            .map(|s| s.as_str())
+            .unwrap_or(&job.template);
+        let template = resolve_path(base_dir, template_path);
+        if !template.exists() {
+            eprintln!("Warning: template not found for job '{}': {}", job.name, template.display());
+            continue;
+        }
+
+        // Resolve data: if absolute use as-is, else prepend data_path (if set) or base_dir
+        let data_path_str = &job.data;
+        let excel = if Path::new(data_path_str).is_absolute() {
+            PathBuf::from(data_path_str)
+        } else if let Some(ref dp) = runfile.data_path {
+            resolve_path(base_dir, dp).join(data_path_str)
+        } else {
+            resolve_path(base_dir, data_path_str)
+        };
+        if !excel.exists() {
+            eprintln!("Warning: Excel not found for job '{}': {}", job.name, excel.display());
+            continue;
+        }
+
+        // Resolve output: per-job output > default_output > fallback
+        let output = if let Some(ref custom) = job.output {
+            resolve_path(base_dir, custom)
+        } else if let Some(ref default) = runfile.default_output {
+            resolve_path(base_dir, &default.replace("{name}", &job.name))
+        } else {
+            base_dir.join(format!("{}.pptx", job.name))
+        };
+
+        jobs.push(ResolvedJob { name: job.name.clone(), template, excel, output });
+    }
+
+    Ok(jobs)
+}
+
+/// Resolve jobs from legacy `[jobs."template"]` format.
+fn resolve_jobs_legacy(
+    runfile: &RunFile,
+    jobs_map: &HashMap<String, HashMap<String, JobValue>>,
+    base_dir: &Path,
+) -> OaResult<Vec<ResolvedJob>> {
+    let mut jobs = Vec::new();
+    for (template_path, job_map) in jobs_map {
         let template = resolve_path(base_dir, template_path);
         if !template.exists() {
             eprintln!("Warning: template not found: {}", template.display());
@@ -174,8 +279,91 @@ fn toml_value_to_string(v: &toml::Value) -> String {
 mod tests {
     use super::*;
 
+    // --- New v2 format tests ---
+
     #[test]
-    fn test_parse_simple_runfile() {
+    fn test_parse_v2_simple() {
+        let toml_str = r#"
+[[job]]
+name = "Argentina"
+template = "template.pptx"
+data = "data/argentina.xlsx"
+"#;
+        let rf: RunFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(rf.job.len(), 1);
+        assert_eq!(rf.job[0].name, "Argentina");
+        assert_eq!(rf.job[0].template, "template.pptx");
+        assert_eq!(rf.job[0].data, "data/argentina.xlsx");
+        assert!(rf.job[0].output.is_none());
+    }
+
+    #[test]
+    fn test_parse_v2_with_templates_and_data_path() {
+        let toml_str = r#"
+data_path = "../excel_data"
+default_output = "output/{name}.pptx"
+
+[templates]
+t1 = "templates/market_report.pptx"
+
+[[job]]
+name = "Argentina"
+template = "t1"
+data = "rpm_tracking_Argentina.xlsx"
+
+[[job]]
+name = "Brazil"
+template = "t1"
+data = "rpm_tracking_Brazil.xlsx"
+output = "custom/brazil.pptx"
+"#;
+        let rf: RunFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(rf.templates.get("t1").unwrap(), "templates/market_report.pptx");
+        assert_eq!(rf.data_path.as_deref(), Some("../excel_data"));
+        assert_eq!(rf.default_output.as_deref(), Some("output/{name}.pptx"));
+        assert_eq!(rf.job.len(), 2);
+        assert_eq!(rf.job[1].output.as_deref(), Some("custom/brazil.pptx"));
+    }
+
+    #[test]
+    fn test_parse_v2_minimal() {
+        let toml_str = r#"
+[[job]]
+name = "test"
+template = "t.pptx"
+data = "C:/full/path/data.xlsx"
+"#;
+        let rf: RunFile = toml::from_str(toml_str).unwrap();
+        assert!(rf.templates.is_empty());
+        assert!(rf.data_path.is_none());
+        assert!(rf.default_output.is_none());
+        assert!(rf.steps.is_none());
+        assert!(rf.config.is_empty());
+        assert_eq!(rf.job.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_v2_with_steps_and_config() {
+        let toml_str = r#"
+steps = ["links", "tables"]
+
+[config]
+"ccst.positive_prefix" = ""
+
+[[job]]
+name = "test"
+template = "t.pptx"
+data = "data.xlsx"
+"#;
+        let rf: RunFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(rf.steps.as_ref().unwrap(), &["links", "tables"]);
+        assert_eq!(rf.config.len(), 1);
+    }
+
+    // --- Legacy format tests ---
+
+    #[test]
+    fn test_parse_legacy_format() {
         let toml_str = r#"
 default_output = "output/{name}.pptx"
 [jobs."template.pptx"]
@@ -183,38 +371,14 @@ us = "data/us.xlsx"
 mx = "data/mx.xlsx"
 "#;
         let rf: RunFile = toml::from_str(toml_str).unwrap();
-        assert_eq!(rf.default_output.as_deref(), Some("output/{name}.pptx"));
-        assert_eq!(rf.jobs.len(), 1);
-        assert_eq!(rf.jobs.get("template.pptx").unwrap().len(), 2);
+        assert!(rf.job.is_empty());
+        assert!(rf.jobs.is_some());
+        let jobs = rf.jobs.as_ref().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs.get("template.pptx").unwrap().len(), 2);
     }
 
-    #[test]
-    fn test_parse_with_detailed_job() {
-        let toml_str = r#"
-[jobs."template.pptx"]
-us = "data/us.xlsx"
-mx = { data = "data/mx.xlsx", output = "special/mx.pptx" }
-"#;
-        let rf: RunFile = toml::from_str(toml_str).unwrap();
-        let mx = rf.jobs.get("template.pptx").unwrap().get("mx").unwrap();
-        assert_eq!(mx.excel_path(), "data/mx.xlsx");
-        assert_eq!(mx.output_path(), Some("special/mx.pptx"));
-    }
-
-    #[test]
-    fn test_parse_with_steps_and_config() {
-        let toml_str = r#"
-steps = ["links", "tables"]
-[config]
-"ccst.positive_prefix" = ""
-"links.set_manual" = true
-[jobs."template.pptx"]
-us = "data/us.xlsx"
-"#;
-        let rf: RunFile = toml::from_str(toml_str).unwrap();
-        assert_eq!(rf.steps.as_ref().unwrap(), &["links", "tables"]);
-        assert_eq!(rf.config.len(), 2);
-    }
+    // --- Path resolution tests ---
 
     #[test]
     fn test_resolve_path_absolute() {

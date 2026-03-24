@@ -1,0 +1,142 @@
+# oa run test — 26 markets across 2 templates
+
+data_path = "../excel_test_data"
+default_output = "runfile_output/{name}.pptx"
+
+[templates]
+t1 = "test_runfile_template_1.pptx"
+t2 = "test_runfile_template_2.pptx"
+
+# Argentina through Korea → template 1
+
+[[job]]
+name = "Argentina"
+template = "t1"
+data = "rpm_tracking_Argentina_(05_07).xlsx"
+
+[[job]]
+name = "Australia"
+template = "t1"
+data = "rpm_tracking_Australia_(05_15).xlsx"
+
+[[job]]
+name = "Brazil"
+template = "t1"
+data = "rpm_tracking_Brazil_(05_07).xlsx"
+
+[[job]]
+name = "Colombia"
+template = "t1"
+data = "rpm_tracking_Colombia_(05_07).xlsx"
+
+[[job]]
+name = "Czech_Republic"
+template = "t1"
+data = "rpm_tracking_Czech_Republic_(05_07).xlsx"
+
+[[job]]
+name = "France"
+template = "t1"
+data = "rpm_tracking_France_(05_07).xlsx"
+
+[[job]]
+name = "Germany"
+template = "t1"
+data = "rpm_tracking_Germany_(05_07).xlsx"
+
+[[job]]
+name = "Greece"
+template = "t1"
+data = "rpm_tracking_Greece_(05_07).xlsx"
+
+[[job]]
+name = "Indonesia"
+template = "t1"
+data = "rpm_tracking_Indonesia_(05_07).xlsx"
+
+[[job]]
+name = "Italy"
+template = "t1"
+data = "rpm_tracking_Italy_(05_07).xlsx"
+
+[[job]]
+name = "Japan"
+template = "t1"
+data = "rpm_tracking_Japan_(05_07).xlsx"
+
+[[job]]
+name = "Kazakhstan"
+template = "t1"
+data = "rpm_tracking_Kazakhstan_(05_15).xlsx"
+
+[[job]]
+name = "Korea"
+template = "t1"
+data = "rpm_tracking_Korea_(05_07).xlsx"
+
+# Malaysia through United_States → template 2
+
+[[job]]
+name = "Malaysia"
+template = "t2"
+data = "rpm_tracking_Malaysia_(05_07).xlsx"
+
+[[job]]
+name = "Mexico"
+template = "t2"
+data = "rpm_tracking_Mexico_(05_07).xlsx"
+
+[[job]]
+name = "New_Zealand"
+template = "t2"
+data = "rpm_tracking_New_Zealand_(05_07).xlsx"
+
+[[job]]
+name = "Phillippines"
+template = "t2"
+data = "rpm_tracking_Phillippines_(05_07).xlsx"
+
+[[job]]
+name = "Poland"
+template = "t2"
+data = "rpm_tracking_Poland_(05_07).xlsx"
+
+[[job]]
+name = "Portugal"
+template = "t2"
+data = "rpm_tracking_Portugal_(05_09).xlsx"
+
+[[job]]
+name = "Romania"
+template = "t2"
+data = "rpm_tracking_Romania_(05_07).xlsx"
+
+[[job]]
+name = "Serbia"
+template = "t2"
+data = "rpm_tracking_Serbia_(05_07).xlsx"
+
+[[job]]
+name = "South_Africa"
+template = "t2"
+data = "rpm_tracking_South_Africa_(05_07).xlsx"
+
+[[job]]
+name = "Spain"
+template = "t2"
+data = "rpm_tracking_Spain_(05_07).xlsx"
+
+[[job]]
+name = "Taiwan"
+template = "t2"
+data = "rpm_tracking_Taiwan_(05_07).xlsx"
+
+[[job]]
+name = "United_Kingdom"
+template = "t2"
+data = "rpm_tracking_United_Kingdom_(05_07).xlsx"
+
+[[job]]
+name = "United_States"
+template = "t2"
+data = "rpm_tracking_United_States_(05_07).xlsx"

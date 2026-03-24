@@ -78,10 +78,13 @@ pub fn parse_py_runfile(content: &str) -> OaResult<RunFile> {
     }
 
     Ok(RunFile {
+        templates: HashMap::new(),
+        data_path: None,
         default_output,
         steps,
         config,
-        jobs,
+        job: Vec::new(),
+        jobs: Some(jobs),
     })
 }
 
@@ -248,8 +251,8 @@ default_output = "output/{name}.pptx"
 "#;
         let rf = parse_py_runfile(py).unwrap();
         assert_eq!(rf.default_output.as_deref(), Some("output/{name}.pptx"));
-        assert_eq!(rf.jobs.len(), 1);
-        let jobs = rf.jobs.get("template.pptx").unwrap();
+        assert_eq!(rf.jobs.as_ref().unwrap().len(), 1);
+        let jobs = rf.jobs.as_ref().unwrap().get("template.pptx").unwrap();
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs.get("us").unwrap().excel_path(), "data/us.xlsx");
     }
@@ -271,7 +274,7 @@ DATAPATH = "C:/data"
 jobs = { "template.pptx": { "us": f"{DATAPATH}/us.xlsx" } }
 "#;
         let rf = parse_py_runfile(py).unwrap();
-        assert_eq!(rf.jobs.get("template.pptx").unwrap().get("us").unwrap().excel_path(), "C:/data/us.xlsx");
+        assert_eq!(rf.jobs.as_ref().unwrap().get("template.pptx").unwrap().get("us").unwrap().excel_path(), "C:/data/us.xlsx");
     }
 
     #[test]
@@ -281,7 +284,7 @@ jobs = { "template.pptx": { "us": f"{DATAPATH}/us.xlsx" } }
 jobs = { "t.pptx": { "a": "a.xlsx" } }
 "#;
         let rf = parse_py_runfile(py).unwrap();
-        assert_eq!(rf.jobs.len(), 1);
+        assert_eq!(rf.jobs.as_ref().unwrap().len(), 1);
     }
 
     #[test]
@@ -293,6 +296,6 @@ jobs = {
 }
 "#;
         let rf = parse_py_runfile(py).unwrap();
-        assert_eq!(rf.jobs.len(), 2);
+        assert_eq!(rf.jobs.as_ref().unwrap().len(), 2);
     }
 }
