@@ -94,7 +94,7 @@ fn test_clean_no_processes() {
     oa().args(["clean", "-f"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("nothing to clean"));
+        .stdout(predicate::str::contains("No Office processes found"));
 }
 
 #[test]

@@ -41,7 +41,7 @@ pub fn run_clean(force: bool) -> OaResult<()> {
 
     if found.is_empty() {
         println!();
-        println!("  {} {}", s_ok.apply_to("✓"), s_ok.apply_to("nothing to clean"));
+        println!("  {} {}", s_ok.apply_to("✓"), s_ok.apply_to("No Office processes found"));
         return Ok(());
     }
 
