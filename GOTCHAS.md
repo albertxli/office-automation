@@ -117,6 +117,13 @@ COM collections (Slides, Shapes, Worksheets, etc.) expose their `Item` indexer a
 ### #34 ZIP Pre-Relink "Access is denied" (os error 5) (Rust-specific)
 `std::fs::rename()` of `.pptx.tmp` over the original PPTX fails with os error 5 when another process has a file handle — typically SynologyDrive sync agent, Windows Search indexer, antivirus, or Explorer preview pane. Common on first run when the PPTX was last modified on another machine (sync agent locks on detecting a new file). On second run the file is stable and rename succeeds. **The fallback is correct by design:** `update.rs` catches the error, prints a warning, and continues with the original PPTX. COM pipeline updates links normally (slower but correct). ZIP pre-relink is a performance optimization, not required for correctness.
 
+### #36 Empty Chart numCache (ptCount But No pt Elements) (Rust-specific)
+Some charts have `<c:numCache>` with `<c:ptCount val="N"/>` but **zero `<c:pt>` data point elements**. The cache structure exists but contains no actual values. This happens when charts are duplicated in the template without their cache being populated, or when the template was created by a tool that didn't fill the cache.
+
+**Impact on oa update:** The ZIP chart data pre-update rewrites existing `<c:pt>/<c:v>` text but can't replace what doesn't exist. **Fix:** Detect the empty-cache case (no `<c:pt>` seen between `<c:numCache>` start and end) and **inject** new `<c:pt idx="N"><c:v>VALUE</c:v></c:pt>` elements from Excel data before writing `</c:numCache>`.
+
+**Impact on oa check:** Reading cached values from ZIP returns an empty Vec for these series. Comparing `[]` vs `[0.74]` from Excel reports a false mismatch. **Fix:** Skip comparison when cached values are empty (the chart data is unverifiable from the ZIP cache alone).
+
 ### #35 Chart .rels Use Bare Paths (No file:/// Prefix) (Rust-specific)
 OLE link `.rels` in `slides/_rels/` use `file:///C:/path/to/file.xlsx` format. But chart `.rels` in `charts/_rels/` use bare paths: `C:/path/to/file.xlsx` (no `file:///` prefix). The relinker must handle both formats — match and rewrite bare paths as well as `file:///` URIs. Preserve the original format when writing back.
 
