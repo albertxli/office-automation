@@ -102,30 +102,10 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config, ver
     println!();
     println!("  {} {}", s_target.apply_to("▸"), s_target.apply_to(&*file_name));
 
-    let _com = init_com_sta()?;
-    let (stop, handle) = spawn_dialog_dismisser();
-
-    let mut excel_app = create_instance("Excel.Application")?;
-    excel_app.put("Visible", Variant::from(false))?;
-    excel_app.put("DisplayAlerts", Variant::from(false))?;
-
-    let mut ppt_app = create_instance("PowerPoint.Application")?;
-    ppt_app.put("DisplayAlerts", Variant::from(0i32))?;
-
-    let mut presentations = Dispatch::new(ppt_app.get("Presentations")?.as_dispatch()?);
-    let pres_v = presentations.call("Open", &[
-        Variant::from(pptx_str.as_str()),
-        Variant::from(MsoTriState::True as i32),
-        Variant::from(0i32),  // Untitled=False
-        Variant::from(MsoTriState::False as i32),
-    ])?;
-    let mut presentation = Dispatch::new(pres_v.as_dispatch()?);
-    let inventory = build_inventory(&mut presentation);
-
+    // Resolve Excel path BEFORE COM init (fast fail on multi-link or missing file)
     let excel_str = if let Some(ep) = excel_path {
         strip_unc(&std::path::Path::new(ep).canonicalize()?)
     } else {
-        // Auto-detect: check for multiple unique Excel links
         let all_excels = crate::zip_ops::detector::detect_all_linked_excels(pptx);
         if all_excels.is_empty() {
             return Err(crate::error::OaError::Other("Cannot auto-detect Excel file. Use -e.".into()));
@@ -148,6 +128,26 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config, ver
         }
         strip_unc(&detected.canonicalize()?)
     };
+
+    let _com = init_com_sta()?;
+    let (stop, handle) = spawn_dialog_dismisser();
+
+    let mut excel_app = create_instance("Excel.Application")?;
+    excel_app.put("Visible", Variant::from(false))?;
+    excel_app.put("DisplayAlerts", Variant::from(false))?;
+
+    let mut ppt_app = create_instance("PowerPoint.Application")?;
+    ppt_app.put("DisplayAlerts", Variant::from(0i32))?;
+
+    let mut presentations = Dispatch::new(ppt_app.get("Presentations")?.as_dispatch()?);
+    let pres_v = presentations.call("Open", &[
+        Variant::from(pptx_str.as_str()),
+        Variant::from(MsoTriState::True as i32),
+        Variant::from(0i32),  // Untitled=False
+        Variant::from(MsoTriState::False as i32),
+    ])?;
+    let mut presentation = Dispatch::new(pres_v.as_dispatch()?);
+    let inventory = build_inventory(&mut presentation);
 
     // Finish header with data path + divider
     let excel_filename = std::path::Path::new(&excel_str)
