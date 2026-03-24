@@ -13,40 +13,67 @@ use std::path::{Path, PathBuf};
 ///
 /// Returns `None` if no external Excel link is found or the PPTX is invalid.
 pub fn detect_linked_excel(pptx_path: &Path) -> Option<PathBuf> {
-    let file = std::fs::File::open(pptx_path).ok()?;
-    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let all = detect_all_linked_excels(pptx_path);
+    all.into_iter().next()
+}
 
-    for i in 0..archive.len() {
-        let entry = archive.by_index(i).ok()?;
-        let name = entry.name().to_string();
+/// Detect all unique linked Excel file paths from a PPTX.
+///
+/// Returns a Vec of unique PathBufs (by filename, case-insensitive).
+/// Used to check if a PPTX links to multiple Excel files — if so, `-e` is required.
+pub fn detect_all_linked_excels(pptx_path: &Path) -> Vec<PathBuf> {
+    let file = match std::fs::File::open(pptx_path) {
+        Ok(f) => f,
+        Err(_) => return vec![],
+    };
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(_) => return vec![],
+    };
 
-        // Only look in slides/_rels/ (not charts/_rels/)
-        if !name.ends_with(".rels") {
-            continue;
-        }
-        let normalized = name.replace('\\', "/");
-        let parts: Vec<&str> = normalized.split('/').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let rels_dir = parts[parts.len() - 2];
-        let parent_dir = parts[parts.len() - 3];
-        if rels_dir != "_rels" || parent_dir != "slides" {
-            continue;
-        }
+    let mut seen_filenames: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut paths: Vec<PathBuf> = Vec::new();
 
-        // Drop the entry and re-read to avoid borrow issues
-        drop(entry);
-        let mut entry = archive.by_index(i).ok()?;
+    // Collect slide .rels indices first to avoid borrow issues
+    let rels_indices: Vec<usize> = (0..archive.len())
+        .filter(|&i| {
+            if let Ok(entry) = archive.by_index(i) {
+                let name = entry.name().to_string();
+                if !name.ends_with(".rels") { return false; }
+                let normalized = name.replace('\\', "/");
+                let parts: Vec<&str> = normalized.split('/').collect();
+                if parts.len() < 3 { return false; }
+                let rels_dir = parts[parts.len() - 2];
+                let parent_dir = parts[parts.len() - 3];
+                rels_dir == "_rels" && parent_dir == "slides"
+            } else {
+                false
+            }
+        })
+        .collect();
+
+    for i in rels_indices {
+        let mut entry = match archive.by_index(i) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
         let mut xml_data = Vec::new();
-        entry.read_to_end(&mut xml_data).ok()?;
+        if entry.read_to_end(&mut xml_data).is_err() {
+            continue;
+        }
 
-        if let Some(path) = extract_excel_path_from_rels(&xml_data) {
-            return Some(path);
+        // Extract ALL Excel paths from this .rels (not just the first)
+        for path in extract_all_excel_paths_from_rels(&xml_data) {
+            let filename_lower = path.file_name()
+                .map(|f| f.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            if !filename_lower.is_empty() && seen_filenames.insert(filename_lower) {
+                paths.push(path);
+            }
         }
     }
 
-    None
+    paths
 }
 
 /// Parse a .rels XML to find the first external file:/// target pointing to an Excel file.
@@ -102,6 +129,48 @@ fn extract_excel_path_from_rels(data: &[u8]) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Parse a .rels XML to find ALL external targets pointing to Excel files.
+fn extract_all_excel_paths_from_rels(data: &[u8]) -> Vec<PathBuf> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_reader(data);
+    let mut paths = Vec::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) => {
+                if e.local_name().as_ref() != b"Relationship" {
+                    continue;
+                }
+                let target_mode = e.try_get_attribute("TargetMode")
+                    .ok().flatten()
+                    .map(|a| String::from_utf8_lossy(a.value.as_ref()).to_string());
+                if target_mode.as_deref() != Some("External") {
+                    continue;
+                }
+                let target = match e.try_get_attribute("Target").ok().flatten() {
+                    Some(a) => String::from_utf8_lossy(a.value.as_ref()).to_string(),
+                    None => continue,
+                };
+                if !target.starts_with("file:///") {
+                    continue;
+                }
+                let path_str = &target["file:///".len()..];
+                let path_str = strip_suffix_after_extension(path_str);
+                let path_str = percent_decode(&path_str);
+                let path_str = path_str.replace('/', std::path::MAIN_SEPARATOR_STR);
+                paths.push(PathBuf::from(path_str));
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => continue,
+        }
+    }
+
+    paths
 }
 
 /// Decode percent-encoded characters in a URI path (e.g., `%20` → space).

@@ -304,11 +304,28 @@ fn resolve_file_pairs(args: &UpdateArgs) -> OaResult<Vec<FilePair>> {
             // File picker
             pick_excel_file()?
         } else {
-            // Auto-detect from first PPTX
-            detect_linked_excel(&pptx_files[0])
-                .ok_or_else(|| OaError::Config(
-                    "Cannot auto-detect Excel file. Use -e to specify.".into()
-                ))?
+            // Auto-detect from first PPTX — check for multiple links
+            let all_excels = crate::zip_ops::detector::detect_all_linked_excels(&pptx_files[0]);
+            if all_excels.is_empty() {
+                return Err(OaError::Config("Cannot auto-detect Excel file. Use -e to specify.".into()));
+            }
+            if all_excels.len() > 1 {
+                let names: Vec<String> = all_excels.iter()
+                    .filter_map(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
+                    .collect();
+                return Err(OaError::Config(format!(
+                    "Multiple Excel links found ({}). Use -e to specify which file to update with.",
+                    names.join(", ")
+                )));
+            }
+            let detected = &all_excels[0];
+            if !detected.exists() {
+                return Err(OaError::Config(format!(
+                    "Auto-detected Excel file not found: {}. Use -e to specify.",
+                    detected.display()
+                )));
+            }
+            detected.clone()
         };
 
         for pptx in pptx_files {

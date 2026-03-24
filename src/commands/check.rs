@@ -125,9 +125,28 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config, ver
     let excel_str = if let Some(ep) = excel_path {
         strip_unc(&std::path::Path::new(ep).canonicalize()?)
     } else {
-        crate::zip_ops::detector::detect_linked_excel(pptx)
-            .map(|p| strip_unc(&p))
-            .ok_or_else(|| crate::error::OaError::Other("Cannot auto-detect Excel file. Use -e.".into()))?
+        // Auto-detect: check for multiple unique Excel links
+        let all_excels = crate::zip_ops::detector::detect_all_linked_excels(pptx);
+        if all_excels.is_empty() {
+            return Err(crate::error::OaError::Other("Cannot auto-detect Excel file. Use -e.".into()));
+        }
+        if all_excels.len() > 1 {
+            let names: Vec<String> = all_excels.iter()
+                .filter_map(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
+                .collect();
+            return Err(crate::error::OaError::Other(format!(
+                "Multiple Excel links found ({}). Use -e to specify which file to check against.",
+                names.join(", ")
+            )));
+        }
+        let detected = &all_excels[0];
+        if !detected.exists() {
+            return Err(crate::error::OaError::Other(format!(
+                "Auto-detected Excel file not found: {}. Use -e to specify.",
+                detected.display()
+            )));
+        }
+        strip_unc(&detected.canonicalize()?)
     };
 
     // Finish header with data path + divider
