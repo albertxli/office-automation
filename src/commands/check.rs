@@ -581,7 +581,11 @@ fn check_chart_series_values(
 
         // PPT side: read from ZIP cache instead of COM Series.Values
         let ppt_values = if i < ppt_cached.len() {
-            ppt_cached[i].1.clone()
+            let vals = &ppt_cached[i].1;
+            if vals.is_empty() {
+                continue; // Cache exists but no data points (stale/empty cache) — skip
+            }
+            vals.clone()
         } else {
             continue; // No cached data for this series
         };
