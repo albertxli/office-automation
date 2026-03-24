@@ -99,8 +99,12 @@ pub fn run_info(pptx_path: &str) -> OaResult<()> {
     println!("  {} {}", s_cyan.apply_to("▸"), s_cyan.apply_to(&*file_name));
     println!("  {}", s_dim.apply_to("╌".repeat(61)));
 
-    // Slides
+    // File size
+    let file_size = std::fs::metadata(pptx_path).map(|m| m.len()).unwrap_or(0);
     println!();
+    info_row_str("File size", &format_file_size(file_size), false);
+
+    // Slides
     info_row("Slides", slide_count as usize, false);
 
     // OLE links
@@ -123,6 +127,10 @@ pub fn run_info(pptx_path: &str) -> OaResult<()> {
     info_row("Charts", total_charts, false);
     info_row("Linked", inventory.charts.len(), true);
     info_row("Unlinked", unlinked_charts, true);
+    let empty_cache = count_empty_cache_charts(path);
+    if empty_cache > 0 {
+        info_row("Empty cache", empty_cache, true);
+    }
 
     // Special shapes
     let total_special = inventory.count_ntbl + inventory.count_htmp
@@ -197,6 +205,54 @@ fn find_template_shape(presentation: &mut Dispatch, name: &str, slide_index: i32
     }
 
     false
+}
+
+/// Print a dot-leader row with a right-aligned string value (e.g., "12.4 MB").
+fn info_row_str(label: &str, value: &str, indent: bool) {
+    let s_dim = Style::new().dim();
+    let s_count = Style::new().white().bold();
+    let prefix = if indent { "    ╰ " } else { "  " };
+    let target_col: usize = 48;
+
+    let display_len = prefix.chars().count() + label.chars().count() + 1;
+    let leader_len = target_col.saturating_sub(display_len);
+    let padded = format!("{prefix}{label} {}", "·".repeat(leader_len));
+
+    // Right-align the string in 4+ chars
+    println!("{} {:>4}",
+        s_dim.apply_to(&padded),
+        s_count.apply_to(value));
+}
+
+/// Format a byte count as human-readable file size.
+fn format_file_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+/// Count charts with empty numCache (ptCount but no pt elements).
+fn count_empty_cache_charts(pptx_path: &Path) -> usize {
+    let cache = match crate::zip_ops::chart_data::read_all_chart_cache(pptx_path) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+    let mut count = 0;
+    for series_list in cache.values() {
+        for (_ref_str, values) in series_list {
+            if values.is_empty() {
+                count += 1;
+                break; // Count the chart once, not per-series
+            }
+        }
+    }
+    count
 }
 
 /// Print a dot-leader row with right-aligned number.
