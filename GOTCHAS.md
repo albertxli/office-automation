@@ -27,6 +27,9 @@ After crashes, `POWERPNT.EXE` and `EXCEL.EXE` zombies persist. The `oa clean` co
 ### #21 Excel.Quit() Hangs (60 seconds!)
 If `IDispatch` references from inventory/shapes still exist when `Application.Quit()` is called, the process hangs for ~60 seconds waiting for RPC disconnection. **Solution:** Explicitly drop all shape/inventory references BEFORE calling Quit. Drop order: inventory → presentation → Excel quit → PPT quit.
 
+### #39 Rapid COM Create/Destroy Causes 0x80010001 (Rust-specific)
+In batch mode (`oa run` with 26 jobs), calling `Application.Quit()` then immediately `CoCreateInstance` for the next job causes `0x80010001 (RPC_E_CALL_REJECTED)` — the previous process hasn't fully shut down yet. Each COM create/destroy cycle also costs ~1.1s (26 jobs = ~28.6s wasted). **Solution:** `ComSession` struct in `com/session.rs` — create Excel + PowerPoint apps once, reuse across all jobs, only `Quit()` at the end. Between jobs: close presentation + close workbooks, but keep apps alive.
+
 ## Excel Operations
 
 ### #5 Excel UpdateLinks

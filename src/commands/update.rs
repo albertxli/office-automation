@@ -10,14 +10,12 @@ use console::Style;
 
 use crate::cli::{parse_pair, UpdateArgs};
 use crate::com::dispatch::Dispatch;
-use crate::com::session::{create_instance, init_com_sta, spawn_dialog_dismisser, stop_dialog_dismisser};
+use crate::com::session::ComSession;
 use crate::com::variant::Variant;
 use crate::config::Config;
 use crate::error::{OaError, OaResult};
-use crate::office::constants::{MsoTriState, XlCalculation};
 use crate::pipeline::{self, PipelineResults};
 use crate::shapes::inventory::build_inventory;
-use crate::zip_ops::detector::detect_linked_excel;
 use crate::zip_ops::relinker::relink_pptx_zip;
 
 /// A resolved (pptx, excel) pair ready for processing.
@@ -33,8 +31,19 @@ fn strip_unc(path: &Path) -> String {
     s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
 }
 
-/// Run the `oa update` command.
+/// Run the `oa update` command (creates its own COM session).
 pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
+    let mut session = ComSession::new()?;
+    run_update_with_session(args, &mut session)?;
+    Ok(())
+}
+
+/// Run the `oa update` command using an existing COM session.
+///
+/// Returns `(total_objects, total_elapsed_secs)` for batch summary use.
+/// Called directly by `oa run` to reuse one session across all jobs,
+/// avoiding the 0x80010001 error from rapid COM churn (GOTCHA #39).
+pub fn run_update_with_session(args: &UpdateArgs, session: &mut ComSession) -> OaResult<(usize, f64)> {
     // Build config with overrides
     let mut config = Config::default();
     config.apply_overrides(&args.set)?;
@@ -84,16 +93,12 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
 
         let start = Instant::now();
 
-        // COM session (includes ZIP relink inside, in correct order)
-        let result = run_com_pipeline(
+        let result = process_single_file(
+            session,
             &work_path,
             &pair.excel,
             &config,
-            &args.steps,
-            &args.skip,
-            args.dry_run,
-            args.quiet,
-            args.verbose,
+            args,
         );
 
         match result {
@@ -111,48 +116,37 @@ pub fn run_update(args: &UpdateArgs) -> OaResult<()> {
         }
     }
 
-    // Batch summary
+    let total_elapsed = total_start.elapsed().as_secs_f64();
+
+    // Batch summary (for standalone oa update with multiple files)
     if pairs.len() > 1 && !args.quiet {
-        let total_elapsed = total_start.elapsed().as_secs_f64();
         print_batch_completion(&all_results, total_elapsed);
     }
 
-    Ok(())
+    let total_objects: usize = all_results.iter().map(|(_, r, _)| r.total_objects()).sum();
+    Ok((total_objects, total_elapsed))
 }
 
-/// Run the COM-based pipeline on a single PPTX file.
-fn run_com_pipeline(
+/// Process a single PPTX file using an existing COM session.
+///
+/// Performs: ZIP pre-relink -> chart pre-update -> open presentation ->
+/// build inventory -> run pipeline -> save -> cleanup (close pres + workbooks).
+/// The COM session (Excel/PPT apps) stays alive for reuse by the next file.
+fn process_single_file(
+    session: &mut ComSession,
     pptx_path: &Path,
     excel_path: &Path,
     config: &Config,
-    steps_include: &[String],
-    steps_skip: &[String],
-    dry_run: bool,
-    quiet: bool,
-    verbose: bool,
+    args: &UpdateArgs,
 ) -> OaResult<PipelineResults> {
     let pptx_str = strip_unc(&pptx_path.canonicalize()?);
     let excel_str = strip_unc(&excel_path.canonicalize()?);
+    let dry_run = args.dry_run;
+    let quiet = args.quiet;
+    let verbose = args.verbose;
 
-    use crate::pipeline::verbose;
-    verbose::set_verbose(verbose);
-
-    // Initialize COM
-    let t_setup = std::time::Instant::now();
-    let _com = init_com_sta()?;
-    let (stop, handle) = spawn_dialog_dismisser();
-
-    // Create Excel (GOTCHA #28: don't set Calculation mode until workbook is open)
-    let mut excel_app = create_instance("Excel.Application")?;
-    excel_app.put("Visible", Variant::from(false))?;
-    excel_app.put("DisplayAlerts", Variant::from(false))?;
-    excel_app.put("ScreenUpdating", Variant::from(false))?;
-    excel_app.put("EnableEvents", Variant::from(false))?;
-
-    // Create PowerPoint
-    let mut ppt_app = create_instance("PowerPoint.Application")?;
-    ppt_app.put("DisplayAlerts", Variant::from(0i32))?;
-    verbose::note(&format!("COM setup ·················· {:.1}s", t_setup.elapsed().as_secs_f64()));
+    use crate::pipeline::verbose as pverbose;
+    pverbose::set_verbose(verbose);
 
     // ZIP pre-relink (before Open, so PowerPoint reads corrected paths)
     if !dry_run {
@@ -170,7 +164,7 @@ fn run_com_pipeline(
         if let Some(pb) = relink_spinner { pb.finish_and_clear(); }
         if !quiet {
             if verbose {
-                verbose::note(&format!(
+                pverbose::note(&format!(
                     "Relink ····················· {} links ({} OLE + {} charts) · {:.1}s",
                     relink_result.total, relink_result.ole, relink_result.charts, relink_elapsed
                 ));
@@ -185,12 +179,12 @@ fn run_com_pipeline(
     let mut chart_data_ok = false;
     if !dry_run {
         let chart_t = std::time::Instant::now();
-        match zip_chart_preupdate(pptx_path, excel_path, &mut excel_app, quiet, verbose) {
+        match zip_chart_preupdate(pptx_path, excel_path, &mut session.excel_app, quiet, verbose) {
             Ok(result) => {
                 chart_data_ok = result.charts_updated > 0 || result.series_updated == 0;
                 let chart_elapsed = chart_t.elapsed().as_secs_f64();
                 if verbose {
-                    verbose::note(&format!(
+                    pverbose::note(&format!(
                         "Chart pre-update ··········· {} charts ({} series) · {:.1}s",
                         result.charts_updated, result.series_updated, chart_elapsed
                     ));
@@ -198,16 +192,15 @@ fn run_com_pipeline(
             }
             Err(e) => {
                 if verbose {
-                    verbose::note(&format!("Chart pre-update skipped: {e}"));
+                    pverbose::note(&format!("Chart pre-update skipped: {e}"));
                 }
-                // Fall back to COM-based chart update in pipeline
             }
         }
     }
 
     // Open presentation
     let t_open = std::time::Instant::now();
-    let mut presentations = Dispatch::new(ppt_app.get("Presentations")?.as_dispatch()?);
+    let mut presentations = Dispatch::new(session.ppt_app.get("Presentations")?.as_dispatch()?);
     let pres_variant = presentations.call("Open", &[
         Variant::from(pptx_str.as_str()),
         Variant::from(0i32),  // ReadOnly = False
@@ -215,53 +208,50 @@ fn run_com_pipeline(
         Variant::from(0i32),  // WithWindow = False
     ])?;
     let mut presentation = Dispatch::new(pres_variant.as_dispatch()?);
-    verbose::note(&format!("Open PPTX ·················· {:.1}s", t_open.elapsed().as_secs_f64()));
+    pverbose::note(&format!("Open PPTX ·················· {:.1}s", t_open.elapsed().as_secs_f64()));
 
     // Build inventory
     let t_inv = std::time::Instant::now();
     let inventory = build_inventory(&mut presentation);
-    verbose::note(&format!("Build inventory ············ {:.1}s", t_inv.elapsed().as_secs_f64()));
+    pverbose::note(&format!("Build inventory ············ {:.1}s", t_inv.elapsed().as_secs_f64()));
 
     // Run pipeline
-    let results = pipeline::run_pipeline(
+    let pipeline_result = pipeline::run_pipeline(
         &inventory,
         config,
         &mut presentation,
-        &mut excel_app,
+        &mut session.excel_app,
         &excel_str,
-        steps_include,
-        steps_skip,
+        &args.steps,
+        &args.skip,
         quiet,
         verbose,
         chart_data_ok,
-    )?;
+    );
 
-    // Save (unless dry-run)
-    let t_save = std::time::Instant::now();
-    if !dry_run {
-        presentation.call0("Save")?;
+    // Save (unless dry-run or pipeline failed)
+    if let Ok(ref _results) = pipeline_result {
+        let t_save = std::time::Instant::now();
+        if !dry_run {
+            presentation.call0("Save")?;
+        }
+        pverbose::note(&format!("Save ······················· {:.1}s", t_save.elapsed().as_secs_f64()));
     }
-    verbose::note(&format!("Save ······················· {:.1}s", t_save.elapsed().as_secs_f64()));
 
-    // GOTCHA #21: Explicit drop ordering to prevent 60s hang
-    let t_teardown = std::time::Instant::now();
+    // GOTCHA #21: Explicit drop ordering to prevent 60s hang.
+    // Drop all shape/inventory refs before closing the presentation.
+    // Apps stay alive for the next file.
+    let t_cleanup = std::time::Instant::now();
     drop(inventory);
-    presentation.call("Close", &[])?;
+    let _ = presentation.call("Close", &[]);
     drop(presentation);
     drop(presentations);
 
-    let _ = excel_app.put("Calculation", Variant::from(XlCalculation::Automatic as i32));
-    excel_app.call0("Quit")?;
-    drop(excel_app);
+    // Close workbooks between files to free memory
+    session.close_all_workbooks();
+    pverbose::note(&format!("Cleanup ···················· {:.1}s", t_cleanup.elapsed().as_secs_f64()));
 
-    ppt_app.call0("Quit")?;
-    drop(ppt_app);
-    verbose::note(&format!("Teardown ··················· {:.1}s", t_teardown.elapsed().as_secs_f64()));
-
-    // Stop dialog dismisser
-    stop_dialog_dismisser(stop, handle);
-
-    Ok(results)
+    pipeline_result
 }
 
 /// Resolve CLI arguments into (pptx, excel) file pairs.

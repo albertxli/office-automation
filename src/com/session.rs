@@ -2,6 +2,10 @@
 //!
 //! Handles COM initialization (STA), Office application creation via
 //! `CoCreateInstance`, and the background security dialog dismisser thread.
+//!
+//! The [`ComSession`] struct owns a complete COM lifecycle (COM init, Excel app,
+//! PowerPoint app, dialog dismisser) and can be reused across multiple files
+//! to avoid the 1.1s-per-job overhead of creating/destroying COM instances.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,7 +19,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::com::cleanup::ComGuard;
 use crate::com::dispatch::Dispatch;
+use crate::com::variant::Variant;
 use crate::error::{OaError, OaResult};
+use crate::office::constants::XlCalculation;
 
 /// Initialize COM on the current thread with Single-Threaded Apartment model.
 ///
@@ -106,6 +112,97 @@ pub fn stop_dialog_dismisser(
 ) {
     stop.store(true, Ordering::Relaxed);
     let _ = handle.join();
+}
+
+/// A reusable COM session owning Excel + PowerPoint app instances.
+///
+/// Created once and shared across multiple files/jobs to avoid the ~1.1s
+/// overhead of COM init + app creation per file. GOTCHA #39: rapidly
+/// creating/destroying COM instances causes 0x80010001 (RPC_E_CALL_REJECTED).
+///
+/// Drop order matters (GOTCHA #21): `excel_app` and `ppt_app` are declared
+/// before `_com` so they drop first, then `ComGuard` calls `CoUninitialize`.
+pub struct ComSession {
+    // Dialog dismisser — stopped in Drop
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+    // Office apps — quit in Drop (before ComGuard)
+    pub excel_app: Dispatch,
+    pub ppt_app: Dispatch,
+    // COM guard — must be LAST dropped (calls CoUninitialize)
+    _com: ComGuard,
+}
+
+impl ComSession {
+    /// Create a new COM session with Excel and PowerPoint app instances.
+    pub fn new() -> OaResult<Self> {
+        let com = init_com_sta()?;
+        let (stop, handle) = spawn_dialog_dismisser();
+
+        // Create Excel (GOTCHA #28: don't set Calculation mode until workbook is open)
+        let mut excel_app = create_instance("Excel.Application")?;
+        excel_app.put("Visible", Variant::from(false))?;
+        excel_app.put("DisplayAlerts", Variant::from(false))?;
+        excel_app.put("ScreenUpdating", Variant::from(false))?;
+        excel_app.put("EnableEvents", Variant::from(false))?;
+
+        // Create PowerPoint
+        let mut ppt_app = create_instance("PowerPoint.Application")?;
+        ppt_app.put("DisplayAlerts", Variant::from(0i32))?;
+
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+            excel_app,
+            ppt_app,
+            _com: com,
+        })
+    }
+
+    /// Close all open workbooks in the Excel instance.
+    ///
+    /// Called between jobs to free memory. Closes in reverse order
+    /// (standard COM collection practice). Silently ignores errors.
+    pub fn close_all_workbooks(&mut self) {
+        let wbs_var = match self.excel_app.get("Workbooks") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let wbs_disp = match wbs_var.as_dispatch() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut wbs = Dispatch::new(wbs_disp);
+        let count = wbs.get("Count")
+            .and_then(|v| v.as_i32())
+            .unwrap_or(0);
+        // Close in reverse order to avoid index shifting
+        for i in (1..=count).rev() {
+            if let Ok(v) = wbs.call("Item", &[Variant::from(i)])
+                && let Ok(d) = v.as_dispatch()
+            {
+                let mut wb = Dispatch::new(d);
+                let _ = wb.call("Close", &[Variant::from(false)]);
+            }
+        }
+    }
+}
+
+impl Drop for ComSession {
+    fn drop(&mut self) {
+        // GOTCHA #21: Correct drop ordering prevents 60-second hang.
+        // Reset Excel calculation mode, then quit apps.
+        let _ = self.excel_app.put("Calculation", Variant::from(XlCalculation::Automatic as i32));
+        let _ = self.excel_app.call0("Quit");
+        let _ = self.ppt_app.call0("Quit");
+
+        // Stop dialog dismisser thread
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        // _com (ComGuard) drops last via struct field order → CoUninitialize
+    }
 }
 
 #[cfg(test)]

@@ -35,14 +35,27 @@ fn main() {
             if let Err(e) = config.apply_overrides(&args.set) {
                 return eprintln!("Error: {e}");
             }
-            match commands::check::run_check(&args.file, args.excel.as_deref(), &config, args.verbose) {
-                Ok(result) => {
-                    if !result.passed() {
-                        std::process::exit(1);
+            // Detect runfile (.toml/.py) vs single PPTX file
+            let ext = std::path::Path::new(&args.file)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            if ext == "toml" || ext == "py" {
+                match commands::check::run_check_runfile(&args.file, &config, args.verbose) {
+                    Ok(all_passed) => {
+                        if !all_passed { std::process::exit(1); }
+                        Ok(())
                     }
-                    Ok(())
+                    Err(e) => Err(e.to_string()),
                 }
-                Err(e) => Err(e.to_string()),
+            } else {
+                match commands::check::run_check(&args.file, args.excel.as_deref(), &config, args.verbose) {
+                    Ok(result) => {
+                        if !result.passed() { std::process::exit(1); }
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
             }
         }
         Commands::Diff(args) => {

@@ -121,7 +121,7 @@ pub struct RunArgs {
 
 #[derive(Parser, Debug)]
 pub struct CheckArgs {
-    /// PPTX file to validate
+    /// PPTX file or runfile (.toml/.py) to validate
     #[arg(value_name = "FILE")]
     pub file: String,
 

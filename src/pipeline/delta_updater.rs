@@ -127,12 +127,13 @@ pub fn update_deltas(
             excel_path,
         );
 
-        let cell_value = match cell_value {
-            Some(v) if !v.is_empty() => v,
-            _ => continue, // No value found — skip
+        // Empty/missing data → treat as "none" (no change indicator).
+        // Previously this skipped the delta entirely, leaving stale _pos/_neg
+        // shapes from the template or a previous run.
+        let sign = match cell_value {
+            Some(ref v) if !v.is_empty() => determine_sign(v),
+            _ => "none",
         };
-
-        let sign = determine_sign(&cell_value);
 
         // Pick template by sign
         let template = match sign {
@@ -194,10 +195,11 @@ pub fn update_deltas(
         let _ = new_shape.put("Name", Variant::from(new_name.as_str()));
 
         count += 1;
+        let display_value = cell_value.as_deref().unwrap_or("(empty)");
         super::verbose::detail(
             item.slide_index,
             &item.delt_base_name,
-            &format!("{cell_value} → {sign}"),
+            &format!("{display_value} → {sign}"),
         );
     }
 

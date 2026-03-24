@@ -25,9 +25,23 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use console::Style;
+
 use crate::cli::UpdateArgs;
-use crate::commands::update::run_update;
+use crate::com::session::ComSession;
+use crate::commands::update::run_update_with_session;
 use crate::error::{OaError, OaResult};
+
+/// Result of a single job in a batch run.
+enum JobOutcome {
+    Ok { objects: usize, secs: f64 },
+    Err(String),
+}
+
+struct JobResult {
+    name: String,
+    outcome: JobOutcome,
+}
 
 /// Parsed runfile (TOML v2 format).
 #[derive(Debug, Deserialize)]
@@ -91,22 +105,15 @@ impl JobValue {
 }
 
 #[derive(Debug)]
-struct ResolvedJob {
-    name: String,
-    template: PathBuf,
-    excel: PathBuf,
-    output: PathBuf,
+pub struct ResolvedJob {
+    pub name: String,
+    pub template: PathBuf,
+    pub excel: PathBuf,
+    pub output: PathBuf,
 }
 
-/// Run the `oa run` command.
-pub fn run_runfile(
-    runfile_path: &str,
-    check_after: bool,
-    dry_run: bool,
-    verbose: bool,
-    quiet: bool,
-) -> OaResult<()> {
-    let runfile_path = Path::new(runfile_path);
+/// Parse a runfile and resolve all jobs. Returns (jobs, config_overrides, steps).
+pub fn parse_runfile(runfile_path: &Path) -> OaResult<(Vec<ResolvedJob>, Vec<String>, Vec<String>)> {
     if !runfile_path.exists() {
         return Err(OaError::Other(format!("Runfile not found: {}", runfile_path.display())));
     }
@@ -125,7 +132,21 @@ pub fn run_runfile(
         .map(|(k, v)| format!("{k}={}", toml_value_to_string(v)))
         .collect();
 
+    let steps = runfile.steps.clone().unwrap_or_default();
     let jobs = resolve_jobs(&runfile, base_dir)?;
+    Ok((jobs, config_overrides, steps))
+}
+
+/// Run the `oa run` command.
+pub fn run_runfile(
+    runfile_path: &str,
+    check_after: bool,
+    dry_run: bool,
+    verbose: bool,
+    quiet: bool,
+) -> OaResult<()> {
+    let runfile_path = Path::new(runfile_path);
+    let (jobs, config_overrides, steps) = parse_runfile(runfile_path)?;
     if jobs.is_empty() {
         println!("No jobs found in runfile.");
         return Ok(());
@@ -133,18 +154,21 @@ pub fn run_runfile(
 
     println!("Runfile: {} ({} jobs)", runfile_path.display(), jobs.len());
 
-    for job in &jobs {
-        println!("\n--- Job: {} ---", job.name);
-        if let Some(parent) = job.output.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
+    // Create one COM session for all jobs (GOTCHA #39: avoids 0x80010001
+    // from rapid COM create/destroy, saves ~1.1s setup per job).
+    let mut session = ComSession::new()?;
+    let total_start = std::time::Instant::now();
+    let mut results: Vec<JobResult> = Vec::with_capacity(jobs.len());
+
+    for (i, job) in jobs.iter().enumerate() {
+        println!("\n--- Job {}/{}: {} ---", i + 1, jobs.len(), job.name);
+        if let Some(parent) = job.output.parent()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent)?;
         }
 
-        let mut steps = Vec::new();
-        if let Some(ref s) = runfile.steps {
-            steps = s.clone();
-        }
+        let steps = steps.clone();
 
         let args = UpdateArgs {
             files: vec![job.template.to_string_lossy().to_string()],
@@ -161,16 +185,32 @@ pub fn run_runfile(
             quiet,
         };
 
-        if let Err(e) = run_update(&args) {
-            eprintln!("  Job '{}' failed: {e}", job.name);
+        match run_update_with_session(&args, &mut session) {
+            Ok((objects, secs)) => {
+                results.push(JobResult {
+                    name: job.name.clone(),
+                    outcome: JobOutcome::Ok { objects, secs },
+                });
+            }
+            Err(e) => {
+                eprintln!("  Job '{}' failed: {e}", job.name);
+                results.push(JobResult {
+                    name: job.name.clone(),
+                    outcome: JobOutcome::Err(e.to_string()),
+                });
+            }
         }
     }
 
-    println!("\nRunfile complete.");
+    // Session drops here: Quit Excel → Quit PPT → CoUninitialize
+    drop(session);
+
+    let total_elapsed = total_start.elapsed().as_secs_f64();
+    print_run_summary(&results, total_elapsed);
     Ok(())
 }
 
-fn resolve_jobs(runfile: &RunFile, base_dir: &Path) -> OaResult<Vec<ResolvedJob>> {
+pub fn resolve_jobs(runfile: &RunFile, base_dir: &Path) -> OaResult<Vec<ResolvedJob>> {
     // New v2 format: [[job]] array
     if !runfile.job.is_empty() {
         return resolve_jobs_v2(runfile, base_dir);
@@ -273,6 +313,112 @@ fn toml_value_to_string(v: &toml::Value) -> String {
         toml::Value::Boolean(b) => b.to_string(),
         other => other.to_string(),
     }
+}
+
+// ── Batch summary ───────────────────────────────────────────
+
+/// Target column for dot-leader alignment (matches info.rs).
+const SUMMARY_COL: usize = 48;
+
+/// Format elapsed time: under 60s → "42.2s", over → "1m 12s".
+pub fn fmt_time(secs: f64) -> String {
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        let mins = secs as u64 / 60;
+        let rem = secs % 60.0;
+        format!("{mins}m {rem:04.1}s")
+    }
+}
+
+/// Print the batch summary table after all jobs complete.
+fn print_run_summary(results: &[JobResult], total_elapsed: f64) {
+    let s_dim = Style::new().dim();
+    let s_ok = Style::new().green();
+    let s_err = Style::new().red();
+    let s_count = Style::new().white().bold();
+
+    // Separator + header
+    println!();
+    println!("  {}", s_dim.apply_to("═".repeat(39)));
+    println!("  {}", s_dim.apply_to("Job summary"));
+    println!();
+
+    // Per-job recap rows
+    for result in results {
+        let (icon, icon_style) = match &result.outcome {
+            JobOutcome::Ok { .. } => ("✓", &s_ok),
+            JobOutcome::Err(_) => ("✗", &s_err),
+        };
+
+        // "  ✓ " = 4 chars prefix
+        let prefix_len = 4;
+        let name_len = result.name.chars().count();
+        let leader_len = SUMMARY_COL.saturating_sub(prefix_len + name_len + 1);
+        let leaders = "·".repeat(leader_len);
+
+        match &result.outcome {
+            JobOutcome::Ok { objects, secs } => {
+                println!("  {} {} {} {} {} {}",
+                    icon_style.apply_to(icon),
+                    result.name,
+                    s_dim.apply_to(&leaders),
+                    s_count.apply_to(format!("{objects:>4}")),
+                    s_dim.apply_to("objects"),
+                    s_dim.apply_to(format!("{:>6}", fmt_time(*secs))),
+                );
+            }
+            JobOutcome::Err(msg) => {
+                println!("  {} {} {} {}",
+                    icon_style.apply_to(icon),
+                    result.name,
+                    s_dim.apply_to(&leaders),
+                    s_err.apply_to(msg),
+                );
+            }
+        }
+    }
+
+    // Totals
+    let passed: Vec<&JobResult> = results.iter()
+        .filter(|r| matches!(&r.outcome, JobOutcome::Ok { .. }))
+        .collect();
+    let fail_count = results.len() - passed.len();
+    let total_objects: usize = passed.iter()
+        .map(|r| match &r.outcome { JobOutcome::Ok { objects, .. } => *objects, _ => 0 })
+        .sum();
+    let avg_secs = if passed.is_empty() {
+        0.0
+    } else {
+        let sum: f64 = passed.iter()
+            .map(|r| match &r.outcome { JobOutcome::Ok { secs, .. } => *secs, _ => 0.0 })
+            .sum();
+        sum / passed.len() as f64
+    };
+
+    // Totals line
+    let status = if fail_count == 0 {
+        format!("{} {}", s_ok.apply_to("✓"), s_ok.apply_to("all jobs complete"))
+    } else {
+        format!("{} {}", s_err.apply_to("✗"),
+            s_err.apply_to(format!("{fail_count} job{} failed",
+                if fail_count == 1 { "" } else { "s" })))
+    };
+
+    println!();
+    println!("  {} {} {}{} {} {} {} {} {} {}{}",
+        status,
+        s_dim.apply_to("·"),
+        s_count.apply_to(passed.len()),
+        s_dim.apply_to(format!("/{}", results.len())),
+        s_dim.apply_to("files ·"),
+        s_count.apply_to(total_objects),
+        s_dim.apply_to("objects ·"),
+        s_ok.apply_to(fmt_time(total_elapsed)),
+        s_dim.apply_to("· avg"),
+        s_count.apply_to(fmt_time(avg_secs)),
+        s_dim.apply_to("/file"),
+    );
 }
 
 #[cfg(test)]
@@ -396,5 +542,22 @@ mx = "data/mx.xlsx"
     fn test_output_expansion() {
         let expanded = "output/rpm_2024_{name}.pptx".replace("{name}", "australia");
         assert_eq!(expanded, "output/rpm_2024_australia.pptx");
+    }
+
+    // --- Time formatting tests ---
+
+    #[test]
+    fn test_fmt_time_under_60() {
+        assert_eq!(fmt_time(0.0), "0.0s");
+        assert_eq!(fmt_time(5.4), "5.4s");
+        assert_eq!(fmt_time(42.24), "42.2s");
+        assert_eq!(fmt_time(59.9), "59.9s");
+    }
+
+    #[test]
+    fn test_fmt_time_over_60() {
+        assert_eq!(fmt_time(60.0), "1m 00.0s");
+        assert_eq!(fmt_time(72.3), "1m 12.3s");
+        assert_eq!(fmt_time(272.0), "4m 32.0s");
     }
 }

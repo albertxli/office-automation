@@ -10,10 +10,10 @@ use std::time::Instant;
 use console::Style;
 
 use crate::com::dispatch::Dispatch;
-use crate::com::session::{create_instance, init_com_sta, spawn_dialog_dismisser, stop_dialog_dismisser};
+use crate::com::session::{create_instance, init_com_sta, spawn_dialog_dismisser, stop_dialog_dismisser, ComSession};
 use crate::com::variant::Variant;
 use crate::config::Config;
-use crate::error::OaResult;
+use crate::error::{OaError, OaResult};
 use crate::office::constants::MsoTriState;
 use crate::pipeline::color_coder::parse_numeric;
 use crate::pipeline::delta_updater::determine_sign;
@@ -220,6 +220,268 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config, ver
     }
 
     Ok(result)
+}
+
+/// Run `oa check` using an existing COM session (for batch reuse).
+pub fn run_check_with_session(
+    session: &mut ComSession,
+    pptx_path: &str,
+    excel_path: &str,
+    config: &Config,
+    verbose: bool,
+) -> OaResult<CheckResult> {
+    let overall_start = Instant::now();
+    crate::pipeline::verbose::set_verbose(verbose);
+    let pptx = std::path::Path::new(pptx_path);
+    if !pptx.exists() {
+        return Err(OaError::Other(format!("File not found: {pptx_path}")));
+    }
+    let pptx_str = strip_unc(&pptx.canonicalize()?);
+    let excel_str = strip_unc(&std::path::Path::new(excel_path).canonicalize()?);
+
+    let s_target = Style::new().cyan();
+    let s_source = Style::new().yellow();
+    let s_dim = Style::new().dim();
+
+    let file_name = pptx.file_name().unwrap_or_default().to_string_lossy();
+    let excel_filename = std::path::Path::new(&excel_str)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| excel_str.clone());
+
+    println!();
+    println!("  {} {}", s_target.apply_to("▸"), s_target.apply_to(&*file_name));
+    println!("    {} {}", s_source.apply_to("←"), s_source.apply_to(&excel_filename));
+    println!("  {}", s_dim.apply_to("╌".repeat(64)));
+    println!();
+
+    // Open presentation using session's PPT app
+    let mut presentations = Dispatch::new(session.ppt_app.get("Presentations")?.as_dispatch()?);
+    let pres_v = presentations.call("Open", &[
+        Variant::from(pptx_str.as_str()),
+        Variant::from(MsoTriState::True as i32),
+        Variant::from(0i32),
+        Variant::from(MsoTriState::False as i32),
+    ])?;
+    let mut presentation = Dispatch::new(pres_v.as_dispatch()?);
+    let inventory = build_inventory(&mut presentation);
+
+    let mut result = CheckResult::default();
+
+    // Check tables
+    let sp = if !verbose { Some(make_check_spinner("Tables")) } else { None };
+    check_tables(&inventory, &mut session.excel_app, &excel_str, config, &mut result);
+    if let Some(sp) = sp { sp.finish_and_clear(); }
+
+    let sp = if !verbose { Some(make_check_spinner("Deltas")) } else { None };
+    check_deltas(&inventory, &mut session.excel_app, &excel_str, &mut result);
+    if let Some(sp) = sp { sp.finish_and_clear(); }
+
+    let sp = if !verbose { Some(make_check_spinner("Charts")) } else { None };
+    check_charts(&inventory, &mut session.excel_app, &excel_str, pptx, &mut result);
+    if let Some(sp) = sp { sp.finish_and_clear(); }
+
+    // Per-file summary table
+    println!();
+    print_check_row("Tables", result.tbl_checked, None, result.tbl_mismatches.len());
+    print_check_row("Deltas", result.delt_checked, None, result.delt_mismatches.len());
+    print_check_row("Charts", result.chart_count, Some(result.chart_series_checked), result.chart_mismatches.len());
+
+    // Per-file completion line
+    let elapsed = overall_start.elapsed().as_secs_f64();
+    let s_ok = Style::new().green();
+    let s_fail = Style::new().red();
+    let s_count = Style::new().white().bold();
+
+    println!();
+    if result.passed() {
+        println!("  {} {} {} {} {} {} {} {}",
+            s_ok.apply_to("✓ check passed"),
+            s_dim.apply_to("·"),
+            s_count.apply_to(result.total_checked()),
+            s_dim.apply_to("checked"),
+            s_dim.apply_to("·"),
+            s_ok.apply_to("0 mismatches"),
+            s_dim.apply_to("·"),
+            s_ok.apply_to(format!("{elapsed:.1}s")));
+    } else {
+        println!("  {} {} {} {} {} {} {} {}",
+            s_fail.apply_to("✗ check failed"),
+            s_dim.apply_to("·"),
+            s_count.apply_to(result.total_checked()),
+            s_dim.apply_to("checked"),
+            s_dim.apply_to("·"),
+            s_fail.apply_to(format!("{} mismatches", result.total_mismatches())),
+            s_dim.apply_to("·"),
+            s_ok.apply_to(format!("{elapsed:.1}s")));
+    }
+
+    // Cleanup: drop inventory + close pres + close workbooks (keep apps alive)
+    drop(inventory);
+    let _ = presentation.call("Close", &[]);
+    drop(presentation);
+    drop(presentations);
+    session.close_all_workbooks();
+
+    Ok(result)
+}
+
+/// Run `oa check` against all jobs in a runfile. Returns true if all passed.
+pub fn run_check_runfile(
+    runfile_path: &str,
+    config: &Config,
+    verbose: bool,
+) -> OaResult<bool> {
+    use crate::commands::run::{parse_runfile, fmt_time};
+
+    let runfile_path = std::path::Path::new(runfile_path);
+    let (jobs, config_overrides, _steps) = parse_runfile(runfile_path)?;
+    if jobs.is_empty() {
+        println!("No jobs found in runfile.");
+        return Ok(true);
+    }
+
+    // Apply runfile config overrides
+    let mut config = config.clone();
+    config.apply_overrides(&config_overrides)?;
+
+    println!("Check runfile: {} ({} jobs)", runfile_path.display(), jobs.len());
+
+    let mut session = ComSession::new()?;
+    let total_start = Instant::now();
+
+    enum CheckOutcome {
+        Passed { checked: usize, secs: f64 },
+        Failed { checked: usize, mismatches: usize, secs: f64 },
+        Error(String),
+    }
+    struct CheckJobResult {
+        name: String,
+        outcome: CheckOutcome,
+    }
+
+    let mut results: Vec<CheckJobResult> = Vec::with_capacity(jobs.len());
+
+    for (i, job) in jobs.iter().enumerate() {
+        println!("\n--- Check {}/{}: {} ---", i + 1, jobs.len(), job.name);
+
+        let pptx_path = job.output.to_string_lossy().to_string();
+        let excel_path = job.excel.to_string_lossy().to_string();
+
+        let start = Instant::now();
+        match run_check_with_session(&mut session, &pptx_path, &excel_path, &config, verbose) {
+            Ok(result) => {
+                let secs = start.elapsed().as_secs_f64();
+                if result.passed() {
+                    results.push(CheckJobResult {
+                        name: job.name.clone(),
+                        outcome: CheckOutcome::Passed { checked: result.total_checked(), secs },
+                    });
+                } else {
+                    results.push(CheckJobResult {
+                        name: job.name.clone(),
+                        outcome: CheckOutcome::Failed {
+                            checked: result.total_checked(),
+                            mismatches: result.total_mismatches(),
+                            secs,
+                        },
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!("  Check '{}' error: {e}", job.name);
+                results.push(CheckJobResult {
+                    name: job.name.clone(),
+                    outcome: CheckOutcome::Error(e.to_string()),
+                });
+            }
+        }
+    }
+
+    drop(session);
+
+    // Batch summary
+    let total_elapsed = total_start.elapsed().as_secs_f64();
+    let s_dim = Style::new().dim();
+    let s_ok = Style::new().green();
+    let s_err = Style::new().red();
+    let s_count = Style::new().white().bold();
+
+    println!();
+    println!("  {}", s_dim.apply_to("═".repeat(39)));
+    println!("  {}", s_dim.apply_to("Check summary"));
+    println!();
+
+    let col: usize = 48;
+    for r in &results {
+        let prefix_len = 4; // "  ✓ " or "  ✗ "
+        let name_len = r.name.chars().count();
+        let leader_len = col.saturating_sub(prefix_len + name_len + 1);
+        let leaders = "·".repeat(leader_len);
+
+        match &r.outcome {
+            CheckOutcome::Passed { checked, secs } => {
+                println!("  {} {} {} {} {} {}",
+                    s_ok.apply_to("✓"),
+                    r.name,
+                    s_dim.apply_to(&leaders),
+                    s_count.apply_to(format!("{checked:>4}")),
+                    s_dim.apply_to("checked"),
+                    s_dim.apply_to(format!("{:>6}", fmt_time(*secs))),
+                );
+            }
+            CheckOutcome::Failed { mismatches, secs, .. } => {
+                println!("  {} {} {} {} {}",
+                    s_err.apply_to("✗"),
+                    r.name,
+                    s_dim.apply_to(&leaders),
+                    s_err.apply_to(format!("{mismatches} mismatches")),
+                    s_dim.apply_to(format!("{:>6}", fmt_time(*secs))),
+                );
+            }
+            CheckOutcome::Error(msg) => {
+                println!("  {} {} {} {}",
+                    s_err.apply_to("✗"),
+                    r.name,
+                    s_dim.apply_to(&leaders),
+                    s_err.apply_to(msg),
+                );
+            }
+        }
+    }
+
+    let pass_count = results.iter()
+        .filter(|r| matches!(&r.outcome, CheckOutcome::Passed { .. }))
+        .count();
+    let fail_count = results.len() - pass_count;
+    let total_checked: usize = results.iter()
+        .map(|r| match &r.outcome {
+            CheckOutcome::Passed { checked, .. } | CheckOutcome::Failed { checked, .. } => *checked,
+            CheckOutcome::Error(_) => 0,
+        })
+        .sum();
+
+    let status = if fail_count == 0 {
+        format!("{} {}", s_ok.apply_to("✓"), s_ok.apply_to("all checks passed"))
+    } else {
+        format!("{} {}", s_err.apply_to("✗"),
+            s_err.apply_to(format!("{fail_count} check{} failed",
+                if fail_count == 1 { "" } else { "s" })))
+    };
+
+    println!();
+    println!("  {} {} {}{} {} {} {} {}",
+        status,
+        s_dim.apply_to("·"),
+        s_count.apply_to(pass_count),
+        s_dim.apply_to(format!("/{}", results.len())),
+        s_dim.apply_to("files ·"),
+        s_count.apply_to(total_checked),
+        s_dim.apply_to("checked ·"),
+        s_ok.apply_to(fmt_time(total_elapsed)),
+    );
+
+    Ok(fail_count == 0)
 }
 
 /// Create a spinner for a check step.
