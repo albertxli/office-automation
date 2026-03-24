@@ -182,6 +182,7 @@ fn rewrite_chart_cache(
     let mut current_pt_idx: usize = 0;
     let mut series_updated = 0usize;
     let mut seen_pt_in_cache = false; // Track if any <c:pt> exists in current numCache
+    let mut max_pt_idx_seen: usize = 0; // Track highest pt idx written (for partial cache)
 
     loop {
         match reader.read_event() {
@@ -197,6 +198,7 @@ fn rewrite_chart_cache(
                     b"numCache" if in_num_ref => {
                         in_num_cache = true;
                         seen_pt_in_cache = false;
+                        max_pt_idx_seen = 0;
                         // Look up values for current range ref.
                         // For non-contiguous ranges (GOTCHA #20), split on commas
                         // and concatenate values from each sub-range.
@@ -225,11 +227,14 @@ fn rewrite_chart_cache(
                     b"pt" if in_num_cache => {
                         in_pt = true;
                         seen_pt_in_cache = true;
-                        // Get idx attribute
+                        // Get idx attribute (also track max for partial cache detection)
                         current_pt_idx = e.try_get_attribute("idx")
                             .ok().flatten()
                             .and_then(|a| String::from_utf8_lossy(a.value.as_ref()).parse::<usize>().ok())
                             .unwrap_or(0);
+                        if current_pt_idx + 1 > max_pt_idx_seen {
+                            max_pt_idx_seen = current_pt_idx + 1;
+                        }
                     }
                     b"v" if in_pt => { in_v = true; }
                     _ => {}
@@ -252,17 +257,19 @@ fn rewrite_chart_cache(
                     b"val" => { in_val = false; in_num_ref = false; in_num_cache = false; }
                     b"numRef" => { in_num_ref = false; in_num_cache = false; }
                     b"numCache" => {
-                        // Inject <c:pt> elements if cache was empty but we have values
-                        if !seen_pt_in_cache {
-                            if let Some(vals) = current_values {
-                                for (idx, val) in vals.iter().enumerate() {
-                                    // Write: <c:pt idx="N"><c:v>VALUE</c:v></c:pt>
+                        // Inject missing <c:pt> elements:
+                        // - Empty cache (!seen_pt_in_cache): inject ALL values
+                        // - Partial cache (seen some pt but fewer than values): inject remaining
+                        if let Some(vals) = current_values {
+                            let start_idx = if !seen_pt_in_cache { 0 } else { max_pt_idx_seen };
+                            if start_idx < vals.len() {
+                                for idx in start_idx..vals.len() {
                                     let mut pt_start = BytesStart::new("c:pt");
                                     pt_start.push_attribute(("idx", idx.to_string().as_str()));
                                     writer.write_event(Event::Start(pt_start)).map_err(|e| e.to_string())?;
 
                                     writer.write_event(Event::Start(BytesStart::new("c:v"))).map_err(|e| e.to_string())?;
-                                    writer.write_event(Event::Text(BytesText::new(&format!("{val}")))).map_err(|e| e.to_string())?;
+                                    writer.write_event(Event::Text(BytesText::new(&format!("{}", vals[idx])))).map_err(|e| e.to_string())?;
                                     writer.write_event(Event::End(BytesEnd::new("c:v"))).map_err(|e| e.to_string())?;
 
                                     writer.write_event(Event::End(BytesEnd::new("c:pt"))).map_err(|e| e.to_string())?;
