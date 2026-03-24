@@ -160,7 +160,7 @@ fn rewrite_chart_cache(
     xml: &[u8],
     range_values: &HashMap<String, Vec<f64>>,
 ) -> Result<(Vec<u8>, usize), String> {
-    use quick_xml::events::{BytesText, Event};
+    use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
     use quick_xml::reader::Reader;
     use quick_xml::writer::Writer;
 
@@ -181,6 +181,7 @@ fn rewrite_chart_cache(
     let mut combined_values_buf: Option<Vec<f64>> = None; // Buffer for non-contiguous ranges
     let mut current_pt_idx: usize = 0;
     let mut series_updated = 0usize;
+    let mut seen_pt_in_cache = false; // Track if any <c:pt> exists in current numCache
 
     loop {
         match reader.read_event() {
@@ -195,6 +196,7 @@ fn rewrite_chart_cache(
                     b"f" if in_num_ref => { in_f = true; }
                     b"numCache" if in_num_ref => {
                         in_num_cache = true;
+                        seen_pt_in_cache = false;
                         // Look up values for current range ref.
                         // For non-contiguous ranges (GOTCHA #20), split on commas
                         // and concatenate values from each sub-range.
@@ -222,6 +224,7 @@ fn rewrite_chart_cache(
                     }
                     b"pt" if in_num_cache => {
                         in_pt = true;
+                        seen_pt_in_cache = true;
                         // Get idx attribute
                         current_pt_idx = e.try_get_attribute("idx")
                             .ok().flatten()
@@ -248,7 +251,27 @@ fn rewrite_chart_cache(
                     }
                     b"val" => { in_val = false; in_num_ref = false; in_num_cache = false; }
                     b"numRef" => { in_num_ref = false; in_num_cache = false; }
-                    b"numCache" => { in_num_cache = false; }
+                    b"numCache" => {
+                        // Inject <c:pt> elements if cache was empty but we have values
+                        if !seen_pt_in_cache {
+                            if let Some(vals) = current_values {
+                                for (idx, val) in vals.iter().enumerate() {
+                                    // Write: <c:pt idx="N"><c:v>VALUE</c:v></c:pt>
+                                    let mut pt_start = BytesStart::new("c:pt");
+                                    pt_start.push_attribute(("idx", idx.to_string().as_str()));
+                                    writer.write_event(Event::Start(pt_start)).map_err(|e| e.to_string())?;
+
+                                    writer.write_event(Event::Start(BytesStart::new("c:v"))).map_err(|e| e.to_string())?;
+                                    writer.write_event(Event::Text(BytesText::new(&format!("{val}")))).map_err(|e| e.to_string())?;
+                                    writer.write_event(Event::End(BytesEnd::new("c:v"))).map_err(|e| e.to_string())?;
+
+                                    writer.write_event(Event::End(BytesEnd::new("c:pt"))).map_err(|e| e.to_string())?;
+                                }
+                                series_updated += 1;
+                            }
+                        }
+                        in_num_cache = false;
+                    }
                     b"f" => { in_f = false; }
                     b"pt" => { in_pt = false; }
                     b"v" => { in_v = false; }
