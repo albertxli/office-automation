@@ -64,7 +64,7 @@ fn main() {
                 .map_err(|e| e.to_string())
         }
         Commands::Info(args) => {
-            commands::info::run_info(&args.file).map_err(|e| e.to_string())
+            commands::info::run_info(&args.file, args.verbose).map_err(|e| e.to_string())
         }
         Commands::Clean(args) => {
             commands::clean::run_clean(args.force).map_err(|e| e.to_string())

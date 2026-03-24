@@ -14,8 +14,26 @@ use crate::office::constants::MsoTriState;
 use crate::shapes::inventory::build_inventory;
 use crate::utils::link_parser::extract_file_path;
 
+/// Per-slide shape counts for verbose output.
+struct SlideBreakdown {
+    slide: i32,
+    ole: usize,
+    chart: usize,
+    ntbl: usize,
+    htmp: usize,
+    trns: usize,
+    delt: usize,
+    ccst: usize,
+}
+
+impl SlideBreakdown {
+    fn total(&self) -> usize {
+        self.ole + self.chart + self.ntbl + self.htmp + self.trns + self.delt + self.ccst
+    }
+}
+
 /// Run the `oa info` command — inspect a PPTX file.
-pub fn run_info(pptx_path: &str) -> OaResult<()> {
+pub fn run_info(pptx_path: &str, verbose: bool) -> OaResult<()> {
     let path = Path::new(pptx_path);
     if !path.exists() {
         eprintln!("File not found: {pptx_path}");
@@ -79,6 +97,13 @@ pub fn run_info(pptx_path: &str) -> OaResult<()> {
 
     // Count unlinked charts
     let unlinked_charts = count_unlinked_charts(&mut presentation);
+
+    // Collect per-slide breakdown from inventory (before dropping COM refs)
+    let per_slide = if verbose {
+        collect_per_slide_breakdown(&inventory, slide_count)
+    } else {
+        Vec::new()
+    };
 
     // --- Cleanup COM before printing ---
     // GOTCHA #21: Drop all refs before Quit
@@ -148,6 +173,11 @@ pub fn run_info(pptx_path: &str) -> OaResult<()> {
     println!("  {}", s_dim.apply_to("Delta templates"));
     for (name, found) in &template_found {
         info_row_status(name, *found);
+    }
+
+    // Per-slide breakdown (verbose only)
+    if verbose && !per_slide.is_empty() {
+        print_per_slide_breakdown(&per_slide, slide_count);
     }
 
     Ok(())
@@ -355,4 +385,112 @@ fn count_unlinked_charts(presentation: &mut Dispatch) -> usize {
     }
 
     count
+}
+
+/// Collect per-slide shape counts from the inventory.
+fn collect_per_slide_breakdown(
+    inventory: &crate::shapes::inventory::SlideInventory,
+    slide_count: i32,
+) -> Vec<SlideBreakdown> {
+    use crate::shapes::matcher::TableType;
+
+    let mut slides: HashMap<i32, SlideBreakdown> = HashMap::new();
+
+    for s in 1..=slide_count {
+        slides.insert(s, SlideBreakdown {
+            slide: s, ole: 0, chart: 0, ntbl: 0, htmp: 0, trns: 0, delt: 0, ccst: 0,
+        });
+    }
+
+    for ole in &inventory.ole_shapes {
+        if let Some(entry) = slides.get_mut(&ole.slide_index) {
+            entry.ole += 1;
+        }
+    }
+
+    for chart in &inventory.charts {
+        if let Some(entry) = slides.get_mut(&chart.slide_index) {
+            entry.chart += 1;
+        }
+    }
+
+    for ((slide_idx, _), table_info) in &inventory.tables {
+        if let Some(entry) = slides.get_mut(slide_idx) {
+            match table_info.table_type {
+                TableType::Normal => entry.ntbl += 1,
+                TableType::Heatmap => entry.htmp += 1,
+                TableType::Transposed => entry.trns += 1,
+            }
+        }
+    }
+
+    for ((slide_idx, _), _) in &inventory.delts {
+        if let Some(entry) = slides.get_mut(slide_idx) {
+            entry.delt += 1;
+        }
+    }
+
+    for ccst in &inventory.ccst_tables {
+        if let Some(entry) = slides.get_mut(&ccst.slide_index) {
+            entry.ccst += 1;
+        }
+    }
+
+    let mut result: Vec<SlideBreakdown> = slides.into_values().collect();
+    result.sort_by_key(|s| s.slide);
+    result
+}
+
+/// Print the per-slide breakdown table.
+fn print_per_slide_breakdown(per_slide: &[SlideBreakdown], total_slides: i32) {
+    let s_dim = Style::new().dim();
+    let s_count = Style::new().white().bold();
+
+    let divider = "╌".repeat(70);
+
+    println!();
+    println!("  {}", s_dim.apply_to("Per-slide breakdown"));
+    println!("  {}", s_dim.apply_to(&divider));
+    println!("  {}",
+        s_dim.apply_to("  slide    ole  chart   ntbl   htmp   trns   delt   ccst  total"));
+    println!();
+
+    let mut active = 0usize;
+    for row in per_slide {
+        let total = row.total();
+        if total == 0 { continue; }
+        active += 1;
+
+        print!("  ");
+        print!("{}", s_dim.apply_to(format!("{:>6}", row.slide)));
+        print_cell(row.ole, &s_dim, &s_count);
+        print_cell(row.chart, &s_dim, &s_count);
+        print_cell(row.ntbl, &s_dim, &s_count);
+        print_cell(row.htmp, &s_dim, &s_count);
+        print_cell(row.trns, &s_dim, &s_count);
+        print_cell(row.delt, &s_dim, &s_count);
+        print_cell(row.ccst, &s_dim, &s_count);
+        print!("  {}", s_count.apply_to(format!("{:>4}", total)));
+        println!();
+    }
+
+    let empty = total_slides as usize - active;
+    println!("  {}", s_dim.apply_to(&divider));
+    println!("  {} {} {} {} {} {}",
+        s_count.apply_to(total_slides),
+        s_dim.apply_to("slides ·"),
+        s_count.apply_to(active),
+        s_dim.apply_to("active ·"),
+        s_count.apply_to(empty),
+        s_dim.apply_to("empty"),
+    );
+}
+
+/// Print a single cell in the per-slide table.
+fn print_cell(value: usize, s_dim: &Style, s_count: &Style) {
+    if value == 0 {
+        print!("{}", s_dim.apply_to(format!("{:>6}", "·")));
+    } else {
+        print!("{}", s_count.apply_to(format!("{:>6}", value)));
+    }
 }

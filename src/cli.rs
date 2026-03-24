@@ -158,6 +158,10 @@ pub struct InfoArgs {
     /// PPTX file to inspect
     #[arg(value_name = "FILE")]
     pub file: String,
+
+    /// Show per-slide breakdown
+    #[arg(short, long)]
+    pub verbose: bool,
 }
 
 #[derive(Parser, Debug)]
