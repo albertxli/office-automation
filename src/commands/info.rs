@@ -447,7 +447,7 @@ fn print_per_slide_breakdown(per_slide: &[SlideBreakdown], total_slides: i32) {
     let s_count = Style::new().white().bold();
 
     // Use exactly {:>6} for every column — header and data use the same format
-    let divider = "╌".repeat(60);
+    let divider = "╌".repeat(63);
 
     println!();
     println!("  {}", s_dim.apply_to("Per-slide breakdown"));
