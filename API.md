@@ -8,17 +8,23 @@ Windows-only CLI tool that automates Microsoft Office (PowerPoint + Excel) via C
 # Update a single presentation with new Excel data
 oa update report.pptx -e data.xlsx
 
-# Update and save to a new file
-oa update template.pptx -e data.xlsx -o output/report.pptx
+# Batch process 26 countries from a runfile
+oa run batch.toml
+
+# Validate all outputs against Excel
+oa check batch.toml
 
 # Inspect a PPTX file (read-only)
 oa info report.pptx
+
+# Per-slide shape breakdown
+oa info -v report.pptx
 
 # Show all config keys and defaults
 oa config
 
 # Kill zombie Office processes
-oa clean -f
+oa clean
 ```
 
 ---
@@ -65,6 +71,13 @@ oa update <FILES...> [OPTIONS]
 | `coloring` | No | Apply sign-based color coding (_ccst shapes) |
 | `charts` | Yes | Update chart data links |
 
+**Pre-pipeline ZIP operations** (run before COM, no PowerPoint needed):
+
+| Operation | Description |
+|-----------|-------------|
+| ZIP pre-relink | Rewrite OLE/chart paths in PPTX XML (0.1s vs 100s via COM) |
+| ZIP chart pre-update | Rewrite chart numCache values directly in XML |
+
 **Examples:**
 
 ```bash
@@ -87,7 +100,7 @@ oa update "reports/*.pptx" -e data.xlsx
 oa update --pair us_report.pptx=us_data.xlsx --pair mx_report.pptx=mx_data.xlsx
 
 # Override config values
-oa update report.pptx -e data.xlsx --set ccst.positive_color=#00FF00 --set links.set_manual=false
+oa update report.pptx -e data.xlsx --set ccst.positive_color=#00FF00
 
 # Dry run: see what would happen without saving
 oa update report.pptx -e data.xlsx --dry-run
@@ -98,135 +111,17 @@ oa update report.pptx -e data.xlsx --check
 # Auto-detect Excel from OLE links in the PPTX
 oa update report.pptx
 
-# Quiet mode for scripts
-oa update report.pptx -e data.xlsx -q
-
 # Open file dialog to select Excel
 oa update report.pptx --pick
 ```
 
 ---
 
-### `oa info` — Inspect a PPTX file
-
-Read-only inspection. Shows slide count, OLE links, charts, special shapes, and delta templates.
-
-```
-oa info <FILE>
-```
-
-**Example:**
-
-```bash
-oa info template.pptx
-```
-
-**Output:**
-
-```
-Presentation
-  File:   template.pptx
-  Slides: 30
-
-OLE Links
-  C:\Data\report.xlsx                                              86
-  Total                                                            86
-
-Charts
-  Linked:   100
-  Unlinked: 0
-
-Special Shapes
-  ntbl_ (normal tables):    49
-  htmp_ (heatmap tables):   0
-  trns_ (transposed):       31
-  delt_ (delta indicators): 6
-  _ccst (color-coded):      24
-
-Delta Templates (Slide 1)
-  tmpl_delta_pos                 ✓
-  tmpl_delta_neg                 ✓
-  tmpl_delta_none                ✓
-```
-
----
-
-### `oa check` — Validate PPT against Excel
-
-Cell-by-cell comparison of table values and delta sign verification. Exit code 0 = pass, 1 = mismatches found.
-
-```
-oa check <FILE> [OPTIONS]
-```
-
-**Options:**
-
-| Flag | Description |
-|------|-------------|
-| `-e, --excel <PATH>` | Excel to check against (auto-detected if omitted) |
-| `--set <KEY=VALUE>` | Override config values (repeatable) |
-| `-v, --verbose` | Debug logging |
-
-**What it checks:**
-- **Tables**: Every cell in every linked table is compared to its Excel source
-- **Transposed tables**: Handles row/col swap correctly
-- **_ccst tables**: Applies the same transform (prefix, symbol removal) before comparing
-- **Deltas**: Verifies shape sign suffix (_pos/_neg/_none) matches Excel value
-
-**Examples:**
-
-```bash
-# Check against specific Excel file
-oa check report.pptx -e data.xlsx
-
-# Auto-detect Excel from OLE links
-oa check report.pptx
-
-# Use in CI: exit code 1 on mismatch
-oa check report.pptx -e data.xlsx || echo "VALIDATION FAILED"
-```
-
-**Output on mismatch:**
-
-```
-TABLE MISMATCHES (3):
-  Slide 5, Object_revenue: Cell (2,1): PPT="45%" vs Expected="52%"
-  Slide 5, Object_revenue: Cell (3,1): PPT="30%" vs Expected="25%"
-  Slide 8, Object_costs: Cell (1,1): PPT="$1.2M" vs Expected="$1.5M"
-
-CHECK FAILED: 3 table mismatches, 0 delta mismatches (of 150 checked)
-```
-
----
-
-### `oa diff` — Compare two PPTX files
-
-Side-by-side comparison of two presentations. Read-only, no Excel needed.
-
-```
-oa diff <A.pptx> <B.pptx> [-v]
-```
-
-**What it compares:**
-- Shape inventory counts (ntbl_, htmp_, trns_, delt_, _ccst)
-- Table cell values for matching shapes
-- Chart counts
-
-**Examples:**
-
-```bash
-# Compare template vs updated version
-oa diff template.pptx updated_report.pptx
-
-# Compare two country reports
-oa diff us_report.pptx mx_report.pptx
-```
-
----
-
 ### `oa run` — Execute a TOML runfile
 
-Batch processing from a TOML configuration file. Replaces Python runfiles.
+Batch processing from a TOML configuration file. Processes all jobs sequentially using a single shared COM session (avoids 0x80010001 errors from rapid COM create/destroy).
+
+Prints a rich summary table after all jobs complete showing per-job pass/fail, object counts, timing, and totals.
 
 ```
 oa run <RUNFILE.toml> [OPTIONS]
@@ -236,7 +131,7 @@ oa run <RUNFILE.toml> [OPTIONS]
 
 | Flag | Description |
 |------|-------------|
-| `--check` | Validate after each job |
+| `--check` | Run validation after each job |
 | `--dry-run` | Don't save changes |
 | `-v, --verbose` | Debug logging |
 | `-q, --quiet` | Errors only |
@@ -287,6 +182,214 @@ oa run batch.toml --check
 oa run batch.toml -q
 ```
 
+**Example output:**
+
+```
+Runfile: batch.toml (26 jobs)
+
+--- Job 1/26: Argentina ---
+  ▸ template.pptx
+    ← rpm_tracking_Argentina.xlsx
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  • Relink ·······················  411   0.1s
+  • Tables ·······················  155   1.2s
+  • Deltas ·······················    5   0.4s
+  • Coloring ·····················    5   0.1s
+  • Charts ·······················  257   0.3s
+  ✓ completed · 577 objects · 5.9s
+
+[... 24 more jobs ...]
+
+  ═══════════════════════════════════════
+  Job summary
+
+  ✓ Argentina ··················  577 objects   5.9s
+  ✓ Australia ··················  577 objects   5.7s
+  ✗ Brazil ····················· Excel file not found
+  ...
+
+  ✓ all jobs complete · 26/26 files · 15262 objects · 2m 36.1s · avg 5.9s/file
+```
+
+---
+
+### `oa check` — Validate PPT against Excel
+
+Cell-by-cell comparison of table values, delta sign verification, and chart data validation. Supports both single PPTX files and batch validation via runfiles.
+
+Exit code 0 = pass, 1 = mismatches found.
+
+```
+oa check <FILE> [OPTIONS]
+```
+
+**Arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `<FILE>` | PPTX file or runfile (`.toml`/`.py`) to validate |
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `-e, --excel <PATH>` | Excel to check against (auto-detected if omitted) |
+| `--set <KEY=VALUE>` | Override config values (repeatable) |
+| `-v, --verbose` | Show per-cell comparison details |
+
+**What it checks:**
+- **Tables**: Every cell in every linked table compared to its Excel source
+- **Transposed tables**: Handles row/col swap correctly
+- **_ccst tables**: Applies the same transform (prefix, symbol removal) before comparing
+- **Deltas**: Verifies shape sign suffix (_pos/_neg/_none) matches Excel value
+- **Charts**: Link targets, series counts, series values (cached vs Excel)
+
+**Examples:**
+
+```bash
+# Check a single file against specific Excel
+oa check report.pptx -e data.xlsx
+
+# Auto-detect Excel from OLE links
+oa check report.pptx
+
+# Batch check all jobs from a runfile
+oa check batch.toml
+
+# Verbose: see every cell comparison
+oa check report.pptx -e data.xlsx -v
+
+# Use in CI: exit code 1 on mismatch
+oa check report.pptx -e data.xlsx || echo "VALIDATION FAILED"
+```
+
+**Example output (single file):**
+
+```
+  ▸ report.pptx
+    ← data.xlsx
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+
+  ✓ Tables ·············· 234 checked                    ·     0 mismatches  PASS
+  ✓ Deltas ··············   5 checked                    ·     0 mismatches  PASS
+  ✓ Charts ·············· 257 checked (546 series)       ·     0 mismatches  PASS
+
+  ✓ check passed · 785 checked · 0 mismatches · 4.3s
+```
+
+**Example output (batch via runfile):**
+
+```
+  ═══════════════════════════════════════
+  Check summary
+
+  ✓ Argentina ··································  785 checked   4.5s
+  ✗ Australia ·································· 4 mismatches   4.4s
+  ✓ Brazil ·····································  785 checked   4.2s
+  ...
+
+  ✗ 1 check failed · 5/6 files · 4740 checked · 27.8s
+```
+
+---
+
+### `oa info` — Inspect a PPTX file
+
+Read-only inspection. Shows slide count, OLE links, charts (linked/unlinked), special shapes, and delta templates. With `-v`, adds a per-slide shape breakdown table.
+
+```
+oa info <FILE> [-v]
+```
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `-v, --verbose` | Show per-slide breakdown table |
+
+**Example (normal):**
+
+```bash
+oa info template.pptx
+```
+
+```
+  ▸ template.pptx
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+
+  File size ···································· 2.7 MB
+  Slides ·······································   68
+
+  OLE links ····································  155
+    ╰ rpm_tracking_Portugal_(05_09).xlsx ·······  155
+
+  Charts ·······································  258
+    ╰ Linked ···································  257
+    ╰ Unlinked ·································    1
+
+  Special shapes ·······························  165
+    ╰ ntbl_ normal tables ······················  122
+    ╰ htmp_ heatmap tables ·····················    0
+    ╰ trns_ transposed tables ··················   33
+    ╰ delt_ delta indicators ···················    5
+    ╰ _ccst color-coded ························    5
+
+  Delta templates
+    ╰ tmpl_delta_pos ···························    ✓
+    ╰ tmpl_delta_neg ···························    ✓
+    ╰ tmpl_delta_none ··························    ✓
+```
+
+**Example (verbose — per-slide breakdown):**
+
+```bash
+oa info -v template.pptx
+```
+
+Appends after the normal output:
+
+```
+  Per-slide breakdown
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+   slide    ole  chart   ntbl   htmp   trns   delt   ccst  total
+
+       1      ·      ·      ·      ·      ·      ·      ·      ·
+       2      5      ·      5      ·      ·      5      5     20
+       3      ·     19      ·      ·      ·      ·      ·     19
+       4      7      ·      5      ·      2      ·      ·     14
+       ...
+      68      ·     19      ·      ·      ·      ·      ·     19
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  68 slides · 42 active · 26 empty
+```
+
+Columns: `slide` (slide number), `ole` (OLE objects), `chart` (linked charts only), `ntbl` (normal tables), `htmp` (heatmap tables), `trns` (transposed tables), `delt` (delta indicators), `ccst` (color-coded shapes), `total` (sum). Zero values shown as `·`. All slides shown including empty ones.
+
+---
+
+### `oa diff` — Compare two PPTX files
+
+Side-by-side comparison of two presentations. Read-only, no Excel needed.
+
+```
+oa diff <A.pptx> <B.pptx> [-v]
+```
+
+**What it compares:**
+- Shape inventory counts (ntbl_, htmp_, trns_, delt_, _ccst)
+- Table cell values for matching shapes
+- Chart counts
+
+**Examples:**
+
+```bash
+# Compare template vs updated version
+oa diff template.pptx updated_report.pptx
+
+# Compare two country reports
+oa diff us_report.pptx mx_report.pptx
+```
+
 ---
 
 ### `oa config` — Show config keys and defaults
@@ -295,28 +398,6 @@ Prints all available `--set` keys with their default values.
 
 ```
 oa config
-```
-
-**Output:**
-
-```
-KEY                            DEFAULT
----                            -------
-heatmap.color_minimum          #F8696B
-heatmap.color_midpoint         #FFEB84
-heatmap.color_maximum          #63BE7B
-heatmap.dark_font              #000000
-heatmap.light_font             #FFFFFF
-ccst.positive_color            #33CC33
-ccst.negative_color            #ED0590
-ccst.neutral_color             #595959
-ccst.positive_prefix           +
-ccst.symbol_removal            %
-delta.template_positive        tmpl_delta_pos
-delta.template_negative        tmpl_delta_neg
-delta.template_none            tmpl_delta_none
-delta.template_slide           1
-links.set_manual               true
 ```
 
 **Config Sections:**
@@ -332,7 +413,7 @@ links.set_manual               true
 
 ### `oa clean` — Kill zombie Office processes
 
-Finds and kills orphaned POWERPNT.EXE and EXCEL.EXE processes left over from crashes.
+Finds and kills orphaned POWERPNT.EXE and EXCEL.EXE processes left over from crashes. Shows found processes with PIDs, prompts for confirmation before killing.
 
 ```
 oa clean [-f]
@@ -347,11 +428,35 @@ oa clean [-f]
 **Examples:**
 
 ```bash
-# Interactive: prompts before killing
+# Interactive: lists processes and prompts before killing
 oa clean
 
 # Force kill (for scripts)
 oa clean -f
+```
+
+**Example output:**
+
+```
+  Found 2 Office processes
+
+  EXCEL.EXE ························ PID 95448
+  POWERPNT.EXE ····················· PID 99640
+
+  Kill all? [y/N] y
+
+  ✓ Killed EXCEL.EXE ················· PID 95448
+  ✓ Killed POWERPNT.EXE ·············· PID 99640
+
+  ✓ cleaned · 2 processes killed
+```
+
+When no processes found:
+
+```
+  Found 0 Office processes
+
+  ✓ No Office processes found
 ```
 
 ---
@@ -368,10 +473,10 @@ oa clean -f
 
 ## Special Shape Naming Conventions
 
-The pipeline identifies shapes by name prefix:
+The pipeline identifies shapes by name prefix/suffix:
 
-| Prefix | Type | Behavior |
-|--------|------|----------|
+| Prefix/Suffix | Type | Behavior |
+|---------------|------|----------|
 | `ntbl_` | Normal table | Preserves formatting, only updates cell text |
 | `htmp_` | Heatmap table | Recalculates 3-color scale from Excel |
 | `trns_` | Transposed table | Swaps rows/columns from Excel range |
@@ -381,15 +486,25 @@ The pipeline identifies shapes by name prefix:
 | `tmpl_delta_neg` | Template | Negative delta arrow template on slide 1 |
 | `tmpl_delta_none` | Template | Neutral delta template on slide 1 |
 
+**Shape-OLE matching:** Table names like `ntbl_Object 1_ccst` are matched to OLE shapes like `Object 1` using word-boundary token matching (the `ntbl_` prefix and `_ccst` suffix are stripped during matching).
+
+**Delta empty data handling:** When the Excel cell for a delta indicator is empty/missing, the delta shape is set to `_none` (neutral indicator) rather than being skipped.
+
 ---
 
 ## Performance
 
 | Scenario | Time |
 |----------|------|
-| 30-slide PPTX, 86 OLE, 100 charts | ~10s |
-| ZIP pre-relink (186 links) | 0.2s |
+| Single 68-slide PPTX (155 OLE, 257 charts) | ~6s |
+| Batch 26 files via `oa run` | ~2m 36s |
+| ZIP pre-relink (411 links) | 0.1s |
+| ZIP chart pre-update (257 charts) | 0.3s |
 | `oa info` inspection | ~3s |
+| `oa check` single file | ~4s |
+| `oa check` batch (6 files via runfile) | ~28s |
 | `oa clean` (no processes) | instant |
 
-Compared to Python `decx` (~40s for the same file), `oa` is approximately **4x faster**.
+**Key optimization:** COM session reuse across batch jobs saves ~28s on 26 jobs by avoiding rapid COM create/destroy (GOTCHA #39).
+
+**Limitation:** PowerPoint is a single-instance COM server (GOTCHA #40). Multiple threads all share one POWERPNT.EXE process, so multi-threaded parallelism provides no speedup for PowerPoint operations.
