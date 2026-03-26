@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use crate::commands::run::{RunFile, JobValue};
-use crate::error::{OaError, OaResult};
+use crate::error::OaResult;
 
 /// Parse a Python runfile (.py) into a RunFile struct.
 pub fn parse_py_runfile(content: &str) -> OaResult<RunFile> {
@@ -102,8 +102,8 @@ fn extract_assignments(source: &str) -> HashMap<String, String> {
             continue;
         }
 
-        if brace_depth == 0 && bracket_depth == 0 {
-            if let Some(eq_pos) = trimmed.find('=') {
+        if brace_depth == 0 && bracket_depth == 0
+            && let Some(eq_pos) = trimmed.find('=') {
                 let var_name = trimmed[..eq_pos].trim();
                 if var_name.chars().all(|c| c.is_alphanumeric() || c == '_') && !var_name.is_empty() {
                     if let Some(prev_var) = current_var.take() {
@@ -118,7 +118,6 @@ fn extract_assignments(source: &str) -> HashMap<String, String> {
                     continue;
                 }
             }
-        }
 
         if current_var.is_some() {
             current_expr.push('\n');
@@ -197,12 +196,15 @@ fn parse_inner_jobs(expr: &str, variables: &HashMap<String, String>) -> HashMap<
     let re_simple = regex::Regex::new(r#""([^"]+)"\s*:\s*(?:f)?"([^"]*)"#).unwrap();
     let re_dict = regex::Regex::new(r#""([^"]+)"\s*:\s*\{([^}]*)\}"#).unwrap();
 
+    let re_data = regex::Regex::new(r#""data"\s*:\s*(?:f")?"([^"]*)"#).unwrap();
+    let re_output = regex::Regex::new(r#""output"\s*:\s*(?:f")?"([^"]*)"#).unwrap();
+
     for caps in re_dict.captures_iter(expr) {
         let name = caps[1].to_string();
         let dict_content = &caps[2];
-        let data = regex::Regex::new(r#""data"\s*:\s*(?:f")?"([^"]*)"#).unwrap()
+        let data = re_data
             .captures(dict_content).map(|c| c[1].to_string()).unwrap_or_default();
-        let output = regex::Regex::new(r#""output"\s*:\s*(?:f")?"([^"]*)"#).unwrap()
+        let output = re_output
             .captures(dict_content).map(|c| c[1].to_string());
         let value = if let Some(out) = output {
             format!("{{\"data\":\"{}\",\"output\":\"{}\"}}", substitute_fstrings(data, variables), substitute_fstrings(out, variables))

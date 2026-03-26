@@ -21,6 +21,7 @@ pub fn hex_to_bgr(hex_color: &str) -> i32 {
 }
 
 /// Convert a BGR Long value back to `#RRGGBB` hex string.
+#[allow(dead_code)]
 pub fn bgr_to_hex(bgr: i32) -> String {
     let r = bgr & 0xFF;
     let g = (bgr >> 8) & 0xFF;

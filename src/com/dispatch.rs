@@ -64,11 +64,13 @@ impl Dispatch {
     }
 
     /// Get the underlying IDispatch reference (for passing to COM functions).
+    #[allow(dead_code)]
     pub fn as_raw(&self) -> &IDispatch {
         &self.inner
     }
 
     /// Consume and return the underlying IDispatch.
+    #[allow(dead_code)]
     pub fn into_raw(self) -> IDispatch {
         self.inner
     }
@@ -110,6 +112,7 @@ impl Dispatch {
     /// Get a property value with arguments (indexed/parameterized property).
     ///
     /// Equivalent to Python: `obj.PropertyName(arg1, arg2)`
+    #[allow(dead_code)]
     pub fn get_with(&mut self, name: &str, args: &[Variant]) -> OaResult<Variant> {
         let dispid = self.get_dispid(name)?;
         self.invoke_raw(dispid, DISPATCH_PROPERTYGET, args)
@@ -186,7 +189,7 @@ impl Dispatch {
             return Err(OaError::Other("Empty navigation path".into()));
         }
 
-        let mut current = self.get(&segments[0])?.as_dispatch()?;
+        let mut current = self.get(segments[0])?.as_dispatch()?;
         let mut current_dispatch = Dispatch::new(current);
 
         for &segment in &segments[1..] {

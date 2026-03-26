@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 /// the first one found. Does NOT require the file to exist on disk (unlike Python).
 ///
 /// Returns `None` if no external Excel link is found or the PPTX is invalid.
+#[allow(dead_code)]
 pub fn detect_linked_excel(pptx_path: &Path) -> Option<PathBuf> {
     let all = detect_all_linked_excels(pptx_path);
     all.into_iter().next()
@@ -76,61 +77,6 @@ pub fn detect_all_linked_excels(pptx_path: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Parse a .rels XML to find the first external file:/// target pointing to an Excel file.
-fn extract_excel_path_from_rels(data: &[u8]) -> Option<PathBuf> {
-    use quick_xml::events::Event;
-    use quick_xml::reader::Reader;
-
-    let mut reader = Reader::from_reader(data);
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) => {
-                if e.local_name().as_ref() != b"Relationship" {
-                    continue;
-                }
-
-                let target_mode = e.try_get_attribute("TargetMode")
-                    .ok()
-                    .flatten()
-                    .map(|a| String::from_utf8_lossy(a.value.as_ref()).to_string());
-
-                if target_mode.as_deref() != Some("External") {
-                    continue;
-                }
-
-                let target = e.try_get_attribute("Target")
-                    .ok()
-                    .flatten()
-                    .map(|a| String::from_utf8_lossy(a.value.as_ref()).to_string())?;
-
-                if !target.starts_with("file:///") {
-                    continue;
-                }
-
-                // Extract file path: strip file:/// prefix and !sheet!range suffix
-                let path_str = &target["file:///".len()..];
-
-                // Find the extension end (handle ! in filenames)
-                let path_str = strip_suffix_after_extension(path_str);
-
-                // Decode percent-encoded characters (e.g., %20 → space)
-                let path_str = percent_decode(&path_str);
-
-                // Normalize slashes
-                let path_str = path_str.replace('/', std::path::MAIN_SEPARATOR_STR);
-
-                return Some(PathBuf::from(path_str));
-            }
-            Ok(Event::Eof) => break,
-            Err(_) => break,
-            _ => continue,
-        }
-    }
-
-    None
-}
-
 /// Parse a .rels XML to find ALL external targets pointing to Excel files.
 fn extract_all_excel_paths_from_rels(data: &[u8]) -> Vec<PathBuf> {
     use quick_xml::events::Event;
@@ -160,7 +106,7 @@ fn extract_all_excel_paths_from_rels(data: &[u8]) -> Vec<PathBuf> {
                 }
                 let path_str = &target["file:///".len()..];
                 let path_str = strip_suffix_after_extension(path_str);
-                let path_str = percent_decode(&path_str);
+                let path_str = percent_decode(path_str);
                 let path_str = path_str.replace('/', std::path::MAIN_SEPARATOR_STR);
                 paths.push(PathBuf::from(path_str));
             }
@@ -182,8 +128,8 @@ fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
+        if bytes[i] == b'%' && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(
                 std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
                 16,
             ) {
@@ -191,7 +137,6 @@ fn percent_decode(s: &str) -> String {
                 i += 3;
                 continue;
             }
-        }
         result.push(bytes[i] as char);
         i += 1;
     }
@@ -266,9 +211,9 @@ mod tests {
   <Relationship Id="rId1" Target="file:///C:/Users/data/report.xlsx!Tables!R1C1:R5C5" TargetMode="External"/>
 </Relationships>"#;
 
-        let result = extract_excel_path_from_rels(xml);
-        assert!(result.is_some());
-        let path = result.unwrap();
+        let results = extract_all_excel_paths_from_rels(xml);
+        assert!(!results.is_empty());
+        let path = &results[0];
         assert!(path.to_string_lossy().contains("report.xlsx"));
     }
 
@@ -279,7 +224,7 @@ mod tests {
   <Relationship Id="rId1" Target="../media/image.png"/>
 </Relationships>"#;
 
-        assert!(extract_excel_path_from_rels(xml).is_none());
+        assert!(extract_all_excel_paths_from_rels(xml).is_empty());
     }
 
     #[test]

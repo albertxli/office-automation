@@ -76,7 +76,7 @@ pub fn run_info(pptx_path: &str, verbose: bool) -> OaResult<()> {
         let mut shape = ole_ref.dispatch.clone();
         let source = shape.nav("LinkFormat")
             .and_then(|mut lf| lf.get("SourceFullName"))
-            .and_then(|v| v.as_string().map_err(|e| e))
+            .and_then(|v| v.as_string())
             .map(|s| extract_file_path(&s))
             .unwrap_or_else(|_| "(unknown)".to_string());
         *ole_sources.entry(source).or_insert(0) += 1;
@@ -216,22 +216,19 @@ fn find_template_shape(presentation: &mut Dispatch, name: &str, slide_index: i32
     };
 
     let count = shapes.get("Count")
-        .and_then(|v| v.as_i32().map_err(|e| e))
+        .and_then(|v| v.as_i32())
         .unwrap_or(0);
 
     for i in 1..=count {
-        if let Ok(v) = shapes.call("Item", &[Variant::from(i)]) {
-            if let Ok(d) = v.as_dispatch() {
+        if let Ok(v) = shapes.call("Item", &[Variant::from(i)])
+            && let Ok(d) = v.as_dispatch() {
                 let mut shp = Dispatch::new(d);
-                if let Ok(n) = shp.get("Name") {
-                    if let Ok(shape_name) = n.as_string() {
-                        if shape_name == name {
+                if let Ok(n) = shp.get("Name")
+                    && let Ok(shape_name) = n.as_string()
+                        && shape_name == name {
                             return true;
                         }
-                    }
-                }
             }
-        }
     }
 
     false
@@ -337,7 +334,7 @@ fn count_unlinked_charts(presentation: &mut Dispatch) -> usize {
     };
 
     let slide_count = slides.get("Count")
-        .and_then(|v| v.as_i32().map_err(|e| e))
+        .and_then(|v| v.as_i32())
         .unwrap_or(0);
 
     for s in 1..=slide_count {
@@ -358,21 +355,21 @@ fn count_unlinked_charts(presentation: &mut Dispatch) -> usize {
         };
 
         let shape_count = shapes.get("Count")
-            .and_then(|v| v.as_i32().map_err(|e| e))
+            .and_then(|v| v.as_i32())
             .unwrap_or(0);
 
         for i in 1..=shape_count {
-            if let Ok(v) = shapes.call("Item", &[Variant::from(i)]) {
-                if let Ok(d) = v.as_dispatch() {
+            if let Ok(v) = shapes.call("Item", &[Variant::from(i)])
+                && let Ok(d) = v.as_dispatch() {
                     let mut shp = Dispatch::new(d);
                     let has_chart = shp.get("HasChart")
-                        .and_then(|v| v.as_i32().map_err(|e| e))
+                        .and_then(|v| v.as_i32())
                         .unwrap_or(0);
 
                     if has_chart != 0 {
                         let is_linked = shp.nav("Chart.ChartData")
                             .and_then(|mut cd| cd.get("IsLinked"))
-                            .and_then(|v| v.as_bool().map_err(|e| e))
+                            .and_then(|v| v.as_bool())
                             .unwrap_or(false);
 
                         if !is_linked {
@@ -380,7 +377,6 @@ fn count_unlinked_charts(presentation: &mut Dispatch) -> usize {
                         }
                     }
                 }
-            }
         }
     }
 
@@ -424,7 +420,7 @@ fn collect_per_slide_breakdown(
         }
     }
 
-    for ((slide_idx, _), _) in &inventory.delts {
+    for (slide_idx, _) in inventory.delts.keys() {
         if let Some(entry) = slides.get_mut(slide_idx) {
             entry.delt += 1;
         }

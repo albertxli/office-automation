@@ -18,10 +18,14 @@ use crate::office::constants::MsoTriState;
 use crate::pipeline::color_coder::parse_numeric;
 use crate::pipeline::delta_updater::determine_sign;
 use crate::pipeline::table_updater::open_or_get_workbook;
+
+/// Series data: Vec of (range_ref, cached_values) per chart.
+type ChartSeriesData = Vec<(String, Vec<f64>)>;
 use crate::shapes::inventory::{build_inventory, SlideInventory};
 use crate::shapes::matcher::TableType;
 use crate::utils::link_parser::parse_source_full_name;
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Mismatch {
     pub slide: i32,
@@ -66,14 +70,13 @@ pub fn apply_ccst_transform(text: &str, config: &Config) -> String {
     let had_percent = s.ends_with('%');
     let test_val = if had_percent { s[..s.len()-1].trim().to_string() } else { s.clone() };
     let parsed = parse_numeric(&s);
-    if let Some(value) = parsed {
-        if value > 0.0 {
+    if let Some(value) = parsed
+        && value > 0.0 {
             let prefix = &config.ccst.positive_prefix;
             if !prefix.is_empty() && !s.starts_with(prefix.as_str()) {
                 s = if had_percent { format!("{prefix}{}", test_val.trim()) + "%" } else { format!("{prefix}{}", test_val.trim()) };
             }
         }
-    }
     let removal = &config.ccst.symbol_removal;
     if !removal.is_empty() {
         if removal.contains('%') && s.ends_with('%') { s.pop(); }
@@ -559,7 +562,7 @@ fn print_check_row(name: &str, checked: usize, series: Option<usize>, mismatches
 // ── Table checking ──────────────────────────────────────────
 
 fn check_tables(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path: &str, config: &Config, result: &mut CheckResult) {
-    let mut workbooks = match excel_app.get("Workbooks").and_then(|v| v.as_dispatch().map_err(|e| e)).map(Dispatch::new) {
+    let mut workbooks = match excel_app.get("Workbooks").and_then(|v| v.as_dispatch()).map(Dispatch::new) {
         Ok(wb) => wb, Err(_) => return,
     };
     for ole_ref in &inventory.ole_shapes {
@@ -567,23 +570,23 @@ fn check_tables(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path
         let key = (ole_ref.slide_index, ole_ref.name.clone());
         let table_info = match inventory.tables.get(&key) { Some(ti) => ti, None => continue };
         let mut ole_shape = ole_ref.dispatch.clone();
-        let source_full = match ole_shape.nav("LinkFormat").and_then(|mut lf| lf.get("SourceFullName")).and_then(|v| v.as_string().map_err(|e| e)) {
+        let source_full = match ole_shape.nav("LinkFormat").and_then(|mut lf| lf.get("SourceFullName")).and_then(|v| v.as_string()) {
             Ok(s) => s, Err(_) => continue,
         };
         let parts = parse_source_full_name(&source_full);
         if parts.range_address == "Not Specified" || parts.sheet_name == "Not Specified" { continue; }
         let mut wb = match open_or_get_workbook(&mut workbooks, excel_path) { Ok(wb) => wb, Err(_) => continue };
-        let excel_range = match wb.get("Worksheets").and_then(|v| v.as_dispatch().map_err(|e| e))
+        let excel_range = match wb.get("Worksheets").and_then(|v| v.as_dispatch())
             .and_then(|d| Dispatch::new(d).call("Item", &[Variant::from(parts.sheet_name.as_str())]))
-            .and_then(|v| v.as_dispatch().map_err(|e| e))
+            .and_then(|v| v.as_dispatch())
             .and_then(|d| Dispatch::new(d).call("Range", &[Variant::from(parts.range_address.as_str())]))
-            .and_then(|v| v.as_dispatch().map_err(|e| e)) { Ok(r) => r, Err(_) => continue };
+            .and_then(|v| v.as_dispatch()) { Ok(r) => r, Err(_) => continue };
         let mut range = Dispatch::new(excel_range);
-        let rows = range.get("Rows").and_then(|v| v.as_dispatch().map_err(|e| e)).and_then(|d| Dispatch::new(d).get("Count")).and_then(|v| v.as_i32().map_err(|e| e)).unwrap_or(0);
-        let cols = range.get("Columns").and_then(|v| v.as_dispatch().map_err(|e| e)).and_then(|d| Dispatch::new(d).get("Count")).and_then(|v| v.as_i32().map_err(|e| e)).unwrap_or(0);
-        let mut cells = match range.get("Cells").and_then(|v| v.as_dispatch().map_err(|e| e)).map(Dispatch::new) { Ok(c) => c, Err(_) => continue };
+        let rows = range.get("Rows").and_then(|v| v.as_dispatch()).and_then(|d| Dispatch::new(d).get("Count")).and_then(|v| v.as_i32()).unwrap_or(0);
+        let cols = range.get("Columns").and_then(|v| v.as_dispatch()).and_then(|d| Dispatch::new(d).get("Count")).and_then(|v| v.as_i32()).unwrap_or(0);
+        let mut cells = match range.get("Cells").and_then(|v| v.as_dispatch()).map(Dispatch::new) { Ok(c) => c, Err(_) => continue };
         let mut tbl_shape = table_info.dispatch.clone();
-        let mut tbl = match tbl_shape.get("Table").and_then(|v| v.as_dispatch().map_err(|e| e)).map(Dispatch::new) { Ok(t) => t, Err(_) => continue };
+        let mut tbl = match tbl_shape.get("Table").and_then(|v| v.as_dispatch()).map(Dispatch::new) { Ok(t) => t, Err(_) => continue };
         let do_transpose = table_info.table_type == TableType::Transposed;
         let is_ccst = table_info.name.contains("_ccst");
 
@@ -637,7 +640,7 @@ fn check_tables(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path
 // ── Delta checking ──────────────────────────────────────────
 
 fn check_deltas(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path: &str, result: &mut CheckResult) {
-    let mut workbooks = match excel_app.get("Workbooks").and_then(|v| v.as_dispatch().map_err(|e| e)).map(Dispatch::new) {
+    let mut workbooks = match excel_app.get("Workbooks").and_then(|v| v.as_dispatch()).map(Dispatch::new) {
         Ok(wb) => wb, Err(_) => return,
     };
     for ole_ref in &inventory.ole_shapes {
@@ -649,22 +652,22 @@ fn check_deltas(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path
             else if delt_ref.name.ends_with("_none") { "none" }
             else { continue };
         let mut ole_shape = ole_ref.dispatch.clone();
-        let source_full = match ole_shape.nav("LinkFormat").and_then(|mut lf| lf.get("SourceFullName")).and_then(|v| v.as_string().map_err(|e| e)) {
+        let source_full = match ole_shape.nav("LinkFormat").and_then(|mut lf| lf.get("SourceFullName")).and_then(|v| v.as_string()) {
             Ok(s) => s, Err(_) => continue,
         };
         let parts = parse_source_full_name(&source_full);
         if parts.range_address == "Not Specified" || parts.sheet_name == "Not Specified" { continue; }
         let excel_text = {
             let mut wb = match open_or_get_workbook(&mut workbooks, excel_path) { Ok(wb) => wb, Err(_) => continue };
-            wb.get("Worksheets").and_then(|v| v.as_dispatch().map_err(|e| e))
+            wb.get("Worksheets").and_then(|v| v.as_dispatch())
                 .and_then(|d| Dispatch::new(d).call("Item", &[Variant::from(parts.sheet_name.as_str())]))
-                .and_then(|v| v.as_dispatch().map_err(|e| e))
+                .and_then(|v| v.as_dispatch())
                 .and_then(|d| Dispatch::new(d).call("Range", &[Variant::from(parts.range_address.as_str())]))
-                .and_then(|v| v.as_dispatch().map_err(|e| e))
+                .and_then(|v| v.as_dispatch())
                 .and_then(|d| Dispatch::new(d).call("Cells", &[Variant::from(1i32), Variant::from(1i32)]))
-                .and_then(|v| v.as_dispatch().map_err(|e| e))
+                .and_then(|v| v.as_dispatch())
                 .and_then(|d| Dispatch::new(d).get("Text"))
-                .and_then(|v| v.as_string().map_err(|e| e)).unwrap_or_default()
+                .and_then(|v| v.as_string()).unwrap_or_default()
         };
         let expected_sign = determine_sign(&excel_text);
         result.delt_checked += 1;
@@ -710,10 +713,7 @@ fn check_charts(
     };
 
     // Pre-read chart cached values from ZIP — avoids COM Series.Values calls
-    let chart_cache_map = match build_chart_cache_map(pptx_path) {
-        Ok(m) => m,
-        Err(_) => HashMap::new(), // Fall back to empty — will use COM
-    };
+    let chart_cache_map = build_chart_cache_map(pptx_path).unwrap_or_default();
 
     let excel_filename = std::path::Path::new(excel_path)
         .file_name()
@@ -722,7 +722,7 @@ fn check_charts(
 
     // Get workbooks collection for Excel reads
     let mut workbooks = match excel_app.get("Workbooks")
-        .and_then(|v| v.as_dispatch().map_err(|e| e))
+        .and_then(|v| v.as_dispatch())
         .map(Dispatch::new)
     {
         Ok(wb) => wb,
@@ -749,15 +749,15 @@ fn check_charts(
             // Series count from COM
             let series_count = shape.nav("Chart")
                 .and_then(|mut ch| ch.call("SeriesCollection", &[]))
-                .and_then(|v| v.as_dispatch().map_err(|e| e))
+                .and_then(|v| v.as_dispatch())
                 .and_then(|d| Dispatch::new(d).get("Count"))
-                .and_then(|v| v.as_i32().map_err(|e| e))
+                .and_then(|v| v.as_i32())
                 .unwrap_or(0);
 
             // Link source
             let link_source = shape.nav("LinkFormat")
                 .and_then(|mut lf| lf.get("SourceFullName"))
-                .and_then(|v| v.as_string().map_err(|e| e))
+                .and_then(|v| v.as_string())
                 .unwrap_or_default();
 
             let key = (*slide_num, *pos_counter);
@@ -771,7 +771,7 @@ fn check_charts(
             if !source_lower.is_empty() && source_lower != "null"
                 && !source_lower.contains(&excel_filename)
             {
-                let short = source_lower.split(['\\', '/'].as_ref()).last().unwrap_or(&source_lower);
+                let short = source_lower.split(['\\', '/'].as_ref()).next_back().unwrap_or(&source_lower);
                 result.chart_mismatches.push(Mismatch {
                     slide: chart_ref.slide_index,
                     shape: chart_ref.name.clone(),
@@ -936,15 +936,6 @@ fn collect_mismatch_pairs(ppt: &[f64], excel: &[f64], max: usize) -> (usize, Vec
     (diff_count, pairs, has_more)
 }
 
-/// Read PPT chart series values via Series.Values (SAFEARRAY of doubles).
-fn read_ppt_series_values(series: &mut Dispatch) -> OaResult<Vec<f64>> {
-    let values_variant = series.get("Values")?;
-    if values_variant.is_empty() {
-        return Ok(vec![]);
-    }
-    values_variant.as_flat_f64_vec()
-}
-
 /// Read Excel values for a chart range reference (supports multi-cell SAFEARRAY).
 ///
 /// Handles non-contiguous ranges like "(Tables!$C$10,Tables!$F$10)" — GOTCHA #20.
@@ -1041,10 +1032,10 @@ fn build_chart_ref_map(pptx_path: &std::path::Path) -> Result<HashMap<(i32, usiz
 /// Build chart CACHED VALUES map from PPTX ZIP.
 /// Returns: {(slide_num, chart_position) → Vec<(range_ref, cached_values)>}
 /// This reads <c:numCache> values directly from the ZIP — no COM needed.
-fn build_chart_cache_map(pptx_path: &std::path::Path) -> Result<HashMap<(i32, usize), Vec<(String, Vec<f64>)>>, String> {
+fn build_chart_cache_map(pptx_path: &std::path::Path) -> Result<HashMap<(i32, usize), ChartSeriesData>, String> {
     let file = std::fs::File::open(pptx_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-    let mut result: HashMap<(i32, usize), Vec<(String, Vec<f64>)>> = HashMap::new();
+    let mut result: HashMap<(i32, usize), ChartSeriesData> = HashMap::new();
 
     let slide_order = get_slide_order(&mut archive)?;
 
@@ -1118,14 +1109,12 @@ fn get_slide_order(archive: &mut zip::ZipArchive<std::fs::File>) -> Result<Vec<S
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Empty(ref e)) | Ok(quick_xml::events::Event::Start(ref e)) => {
-                if e.local_name().as_ref() == b"sldId" {
-                    if let Some(rid) = e.try_get_attribute(b"r:id").ok().flatten()
-                        .map(|a| String::from_utf8_lossy(a.value.as_ref()).to_string()) {
-                        if let Some(target) = rid_map.get(&rid) {
+                if e.local_name().as_ref() == b"sldId"
+                    && let Some(rid) = e.try_get_attribute(b"r:id").ok().flatten()
+                        .map(|a| String::from_utf8_lossy(a.value.as_ref()).to_string())
+                        && let Some(target) = rid_map.get(&rid) {
                             slides.push(format!("ppt/{target}"));
                         }
-                    }
-                }
             }
             Ok(quick_xml::events::Event::Eof) => break,
             Err(_) => break,

@@ -95,12 +95,11 @@ fn dismiss_security_dialog() {
         let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
 
         unsafe {
-            if let Ok(hwnd) = FindWindowW(None, PCWSTR(wide_title.as_ptr())) {
-                if hwnd != HWND::default() {
+            if let Ok(hwnd) = FindWindowW(None, PCWSTR(wide_title.as_ptr()))
+                && hwnd != HWND::default() {
                     // Found the dialog — send WM_CLOSE to dismiss it
                     let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
-            }
         }
     }
 }

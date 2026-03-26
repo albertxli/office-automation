@@ -18,6 +18,7 @@ const VT_R8: u16 = 5;
 const VT_VARIANT: u16 = 12;
 
 /// A value extracted from a SAFEARRAY element (Range.Value2 or Series.Values).
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum CellValue {
     F64(f64),
@@ -26,6 +27,7 @@ pub enum CellValue {
     Empty,
 }
 
+#[allow(dead_code)]
 impl CellValue {
     /// Convert to f64, treating empty/string as 0.0 (matches Python's chart behavior).
     pub fn to_f64(&self) -> f64 {
@@ -101,11 +103,13 @@ impl Variant {
     }
 
     /// Get the inner VARIANT reference for passing to COM calls.
+    #[allow(dead_code)]
     pub fn inner(&self) -> &VARIANT {
         &self.0
     }
 
     /// Get a mutable reference to the inner VARIANT.
+    #[allow(dead_code)]
     pub fn inner_mut(&mut self) -> &mut VARIANT {
         &mut self.0
     }

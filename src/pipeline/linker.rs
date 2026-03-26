@@ -34,7 +34,7 @@ pub fn update_links(
         let mut shape = ole_ref.dispatch.clone();
 
         let result = shape.nav("LinkFormat")
-            .and_then(|mut lf| lf.put("AutoUpdate", Variant::from(PpUpdateOption::Manual as i32)).map_err(|e| e));
+            .and_then(|mut lf| lf.put("AutoUpdate", Variant::from(PpUpdateOption::Manual as i32)));
 
         if result.is_ok() {
             updated += 1;

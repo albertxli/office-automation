@@ -84,15 +84,15 @@ pub fn apply_color_coding(
         };
 
         let rows = table.get("Rows")
-            .and_then(|v| v.as_dispatch().map_err(|e| e))
+            .and_then(|v| v.as_dispatch())
             .and_then(|d| Dispatch::new(d).get("Count"))
-            .and_then(|v| v.as_i32().map_err(|e| e))
+            .and_then(|v| v.as_i32())
             .unwrap_or(0);
 
         let cols = table.get("Columns")
-            .and_then(|v| v.as_dispatch().map_err(|e| e))
+            .and_then(|v| v.as_dispatch())
             .and_then(|d| Dispatch::new(d).get("Count"))
-            .and_then(|v| v.as_i32().map_err(|e| e))
+            .and_then(|v| v.as_i32())
             .unwrap_or(0);
 
         for row in 1..=rows {
@@ -118,7 +118,7 @@ pub fn apply_color_coding(
 
                 let cell_text = cell_shape.nav("TextFrame.TextRange")
                     .and_then(|mut tr| tr.get("Text"))
-                    .and_then(|v| v.as_string().map_err(|e| e))
+                    .and_then(|v| v.as_string())
                     .unwrap_or_default()
                     .trim()
                     .to_string();
@@ -170,12 +170,12 @@ pub fn apply_color_coding(
                 // Single write for text (fix Python's double-write)
                 if final_text != cell_text {
                     let _ = cell_shape.nav("TextFrame.TextRange")
-                        .and_then(|mut tr| tr.put("Text", Variant::from(final_text.as_str())).map_err(|e| e));
+                        .and_then(|mut tr| tr.put("Text", Variant::from(final_text.as_str())));
                 }
 
                 // Set font color
                 let _ = cell_shape.nav("TextFrame.TextRange.Font.Color")
-                    .and_then(|mut fc| fc.put("RGB", Variant::from(color)).map_err(|e| e));
+                    .and_then(|mut fc| fc.put("RGB", Variant::from(color)));
             }
         }
 

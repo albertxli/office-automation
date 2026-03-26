@@ -18,6 +18,7 @@ pub enum OaError {
     #[error("Config error: {0}")]
     Config(String),
 
+    #[allow(dead_code)]
     #[error("Validation error: {0}")]
     Validation(String),
 

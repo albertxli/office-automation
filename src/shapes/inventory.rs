@@ -112,7 +112,7 @@ pub fn build_inventory(presentation: &mut Dispatch) -> SlideInventory {
         };
 
         let slide_index = slide.get("SlideIndex")
-            .and_then(|v| v.as_i32().map_err(|e| e))
+            .and_then(|v| v.as_i32())
             .unwrap_or(s);
 
         let mut shapes = match slide.get("Shapes") {
@@ -132,8 +132,8 @@ pub fn build_inventory(presentation: &mut Dispatch) -> SlideInventory {
         let shape_dispid_cache = shapes.cache();
 
         for i in 1..=shape_count {
-            if let Ok(v) = shapes.call("Item", &[Variant::from(i)]) {
-                if let Ok(d) = v.as_dispatch() {
+            if let Ok(v) = shapes.call("Item", &[Variant::from(i)])
+                && let Ok(d) = v.as_dispatch() {
                     let shape = Dispatch::new_with_cache(d, shape_dispid_cache.clone());
                     scan_shape_recursive(
                         shape,
@@ -143,7 +143,6 @@ pub fn build_inventory(presentation: &mut Dispatch) -> SlideInventory {
                         &mut delt_candidates,
                     );
                 }
-            }
         }
     }
 
@@ -172,14 +171,14 @@ pub fn build_inventory(presentation: &mut Dispatch) -> SlideInventory {
         }
 
         // Delts (same slide only)
-        if !inventory.delts.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Vacant(e) = inventory.delts.entry(key) {
             let found = delt_candidates.iter().position(|dc| {
                 dc.slide_index == ole_ref.slide_index
                     && matcher::is_exact_token_match(&dc.name, &ole_ref.name)
             });
             if let Some(idx) = found {
                 let dc = &delt_candidates[idx];
-                inventory.delts.insert(key, ShapeRef {
+                e.insert(ShapeRef {
                     dispatch: dc.dispatch.clone(),
                     name: dc.name.clone(),
                     slide_index: dc.slide_index,
@@ -200,11 +199,11 @@ fn scan_shape_recursive(
     delt_candidates: &mut Vec<DeltCandidate>,
 ) {
     let name = shape.get("Name")
-        .and_then(|v| v.as_string().map_err(|e| e))
+        .and_then(|v| v.as_string())
         .unwrap_or_default();
 
     let shape_type = shape.get("Type")
-        .and_then(|v| v.as_i32().map_err(|e| e))
+        .and_then(|v| v.as_i32())
         .unwrap_or(0);
 
     // Group shapes
@@ -220,16 +219,16 @@ fn scan_shape_recursive(
         }
 
         // Recurse into group items
-        if let Ok(gi_variant) = shape.get("GroupItems") {
-            if let Ok(gi_dispatch) = gi_variant.as_dispatch() {
+        if let Ok(gi_variant) = shape.get("GroupItems")
+            && let Ok(gi_dispatch) = gi_variant.as_dispatch() {
                 let mut group_items = Dispatch::new(gi_dispatch);
                 let count = group_items.get("Count")
-                    .and_then(|v| v.as_i32().map_err(|e| e))
+                    .and_then(|v| v.as_i32())
                     .unwrap_or(0);
 
                 for i in 1..=count {
-                    if let Ok(v) = group_items.call("Item", &[Variant::from(i)]) {
-                        if let Ok(d) = v.as_dispatch() {
+                    if let Ok(v) = group_items.call("Item", &[Variant::from(i)])
+                        && let Ok(d) = v.as_dispatch() {
                             scan_shape_recursive(
                                 Dispatch::new(d),
                                 slide_index,
@@ -238,20 +237,18 @@ fn scan_shape_recursive(
                                 delt_candidates,
                             );
                         }
-                    }
                 }
             }
-        }
         return;
     }
 
     // Linked OLE Excel.Sheet — skip HasChart/HasTable checks (OLE is never a chart or table)
     if shape_type == MsoShapeType::LinkedOleObject as i32 {
-        if let Ok(lf_variant) = shape.get("LinkFormat") {
-            if lf_variant.as_dispatch().is_ok() {
+        if let Ok(lf_variant) = shape.get("LinkFormat")
+            && lf_variant.as_dispatch().is_ok() {
                 let prog_id = shape.nav("OLEFormat")
                     .and_then(|mut ole| ole.get("ProgID"))
-                    .and_then(|v| v.as_string().map_err(|e| e))
+                    .and_then(|v| v.as_string())
                     .unwrap_or_default();
 
                 if prog_id.contains("Excel.Sheet") {
@@ -262,7 +259,6 @@ fn scan_shape_recursive(
                     });
                 }
             }
-        }
         // delt_ check for non-group OLE shapes still needed
         if name.contains("delt_") {
             delt_candidates.push(DeltCandidate {
@@ -277,13 +273,13 @@ fn scan_shape_recursive(
 
     // Linked charts
     let has_chart = shape.get("HasChart")
-        .and_then(|v| v.as_i32().map_err(|e| e))
+        .and_then(|v| v.as_i32())
         .unwrap_or(0);
 
     if has_chart != 0 {
         let is_linked = shape.nav("Chart.ChartData")
             .and_then(|mut cd| cd.get("IsLinked"))
-            .and_then(|v| v.as_bool().map_err(|e| e))
+            .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
         if is_linked {
@@ -298,7 +294,7 @@ fn scan_shape_recursive(
 
     // Table shapes
     let has_table = shape.get("HasTable")
-        .and_then(|v| v.as_i32().map_err(|e| e))
+        .and_then(|v| v.as_i32())
         .unwrap_or(0);
 
     if has_table != 0 {
@@ -313,8 +309,8 @@ fn scan_shape_recursive(
         }
 
         // ntbl_/htmp_/trns_ candidates
-        if let Some(prefix) = matcher::classify_shape_name(&name) {
-            if let Some(table_type) = matcher::prefix_to_table_type(prefix) {
+        if let Some(prefix) = matcher::classify_shape_name(&name)
+            && let Some(table_type) = matcher::prefix_to_table_type(prefix) {
                 table_candidates.push(TableCandidate {
                     slide_index,
                     dispatch: shape.clone(),
@@ -328,7 +324,6 @@ fn scan_shape_recursive(
                     _ => {}
                 }
             }
-        }
     }
 
     // delt_ candidates (non-group shapes)

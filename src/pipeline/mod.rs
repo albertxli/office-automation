@@ -31,6 +31,7 @@ pub struct StepResult {
     pub name: &'static str,
     pub count: usize,
     pub elapsed_secs: f64,
+    #[allow(dead_code)]
     pub ok: bool,
 }
 
@@ -120,6 +121,7 @@ macro_rules! run_step {
 }
 
 /// Run the update pipeline on a presentation with the given steps.
+#[allow(clippy::too_many_arguments)]
 pub fn run_pipeline(
     inventory: &SlideInventory,
     config: &Config,
@@ -135,7 +137,7 @@ pub fn run_pipeline(
     verbose::set_verbose(verbose);
 
     let active_steps = resolve_steps(steps_include, steps_skip)
-        .map_err(|e| crate::error::OaError::Config(e))?;
+        .map_err(crate::error::OaError::Config)?;
 
     let mut results = PipelineResults::default();
 

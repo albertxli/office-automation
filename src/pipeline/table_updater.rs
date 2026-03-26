@@ -54,7 +54,7 @@ pub fn update_tables(
         // Get link parts
         let source_full = match ole_shape.nav("LinkFormat")
             .and_then(|mut lf| lf.get("SourceFullName"))
-            .and_then(|v| v.as_string().map_err(|e| e))
+            .and_then(|v| v.as_string())
         {
             Ok(s) => s,
             Err(_) => continue,
@@ -181,22 +181,22 @@ fn process_table(
             ])?;
             let mut excel_cell = Dispatch::new_with_cache(excel_cell_variant.as_dispatch()?, excel_cell_cache.clone());
             let cell_text = excel_cell.get("Text")
-                .and_then(|v| v.as_string().map_err(|e| e))
+                .and_then(|v| v.as_string())
                 .unwrap_or_default();
             row_texts.push(cell_text);
 
             if !skip_formatting {
                 let bg_color = excel_cell.nav("DisplayFormat.Interior")
                     .and_then(|mut int| int.get("Color"))
-                    .and_then(|v| v.as_i32().map_err(|e| e))
+                    .and_then(|v| v.as_i32())
                     .unwrap_or(0);
                 let hc = if let Ok(mut ef) = excel_cell.get("Font")
-                    .and_then(|v| v.as_dispatch().map_err(|e| e))
+                    .and_then(|v| v.as_dispatch())
                     .map(Dispatch::new)
                 {
                     Some(HeatmapCell {
                         bg_color,
-                        font_name: ef.get("Name").and_then(|v| v.as_string().map_err(|e| e)).unwrap_or_default(),
+                        font_name: ef.get("Name").and_then(|v| v.as_string()).unwrap_or_default(),
                         font_size: ef.get("Size").unwrap_or_default(),
                         font_bold: ef.get("Bold").unwrap_or_default(),
                         font_italic: ef.get("Italic").unwrap_or_default(),
@@ -242,15 +242,15 @@ fn process_table(
             text_range.put("Text", Variant::from(cell_text.as_str()))?;
 
             // Apply heatmap formatting from pre-read data
-            if !skip_formatting {
-                if let Some(Some(hc)) = heatmap_data.get((excel_row - 1) as usize)
+            if !skip_formatting
+                && let Some(Some(hc)) = heatmap_data.get((excel_row - 1) as usize)
                     .and_then(|row| row.get((excel_col - 1) as usize))
                 {
                     let _ = cell_shape.nav("Fill")
                         .and_then(|mut fill| {
                             fill.call0("Solid")?;
                             fill.nav("ForeColor")
-                                .and_then(|mut fc| fc.put("RGB", Variant::from(hc.bg_color)).map_err(|e| e))
+                                .and_then(|mut fc| fc.put("RGB", Variant::from(hc.bg_color)))
                         });
                     if let Ok(mut ppt_font) = cell_shape.nav("TextFrame.TextRange.Font") {
                         let _ = ppt_font.put("Name", Variant::from(hc.font_name.as_str()));
@@ -258,11 +258,10 @@ fn process_table(
                         let _ = ppt_font.put("Bold", hc.font_bold.clone());
                         let _ = ppt_font.put("Italic", hc.font_italic.clone());
                         let _ = ppt_font.nav("Color").and_then(|mut c| {
-                            c.put("RGB", hc.font_color.clone()).map_err(|e| e)
+                            c.put("RGB", hc.font_color.clone())
                         });
                     }
                 }
-            }
         }
     }
 
@@ -293,20 +292,20 @@ fn apply_heatmap_to_excel(
     let mut crit1 = Dispatch::new(cs.call("ColorScaleCriteria", &[Variant::from(1i32)])?.as_dispatch()?);
     crit1.put("Type", Variant::from(1i32))?; // xlConditionValueLowestValue
     crit1.nav("FormatColor")
-        .and_then(|mut fc| fc.put("Color", Variant::from(color_min)).map_err(|e| e))?;
+        .and_then(|mut fc| fc.put("Color", Variant::from(color_min)))?;
 
     // Criterion 2: 50th percentile → midpoint color
     let mut crit2 = Dispatch::new(cs.call("ColorScaleCriteria", &[Variant::from(2i32)])?.as_dispatch()?);
     crit2.put("Type", Variant::from(4i32))?; // xlConditionValuePercentile
     crit2.put("Value", Variant::from(50i32))?;
     crit2.nav("FormatColor")
-        .and_then(|mut fc| fc.put("Color", Variant::from(color_mid)).map_err(|e| e))?;
+        .and_then(|mut fc| fc.put("Color", Variant::from(color_mid)))?;
 
     // Criterion 3: Highest → maximum color
     let mut crit3 = Dispatch::new(cs.call("ColorScaleCriteria", &[Variant::from(3i32)])?.as_dispatch()?);
     crit3.put("Type", Variant::from(2i32))?; // xlConditionValueHighestValue
     crit3.nav("FormatColor")
-        .and_then(|mut fc| fc.put("Color", Variant::from(color_max)).map_err(|e| e))?;
+        .and_then(|mut fc| fc.put("Color", Variant::from(color_max)))?;
 
     // Recalculate to apply conditional formatting
     let _ = excel_app.call0("Calculate");
@@ -319,21 +318,20 @@ fn apply_heatmap_to_excel(
 
     for r in 1..=rows {
         for c in 1..=cols {
-            if let Ok(cell_v) = cells.call("Item", &[Variant::from(r), Variant::from(c)]) {
-                if let Ok(d) = cell_v.as_dispatch() {
+            if let Ok(cell_v) = cells.call("Item", &[Variant::from(r), Variant::from(c)])
+                && let Ok(d) = cell_v.as_dispatch() {
                     let mut cell = Dispatch::new(d);
                     let bg_color = cell.nav("DisplayFormat.Interior")
                         .and_then(|mut int| int.get("Color"))
-                        .and_then(|v| v.as_i32().map_err(|e| e))
+                        .and_then(|v| v.as_i32())
                         .unwrap_or(0);
 
                     let font_color = contrast_font_color(bg_color, dark_font, light_font);
                     let _ = cell.nav("Font.Color")
-                        .and_then(|mut fc| fc.put("", Variant::from(font_color)).map_err(|e| e))
+                        .and_then(|mut fc| fc.put("", Variant::from(font_color)))
                         // Fallback: set via Font directly
-                        .or_else(|_| cell.nav("Font").and_then(|mut f| f.put("Color", Variant::from(font_color)).map_err(|e| e)));
+                        .or_else(|_| cell.nav("Font").and_then(|mut f| f.put("Color", Variant::from(font_color))));
                 }
-            }
         }
     }
 
@@ -349,21 +347,20 @@ pub fn open_or_get_workbook(workbooks: &mut Dispatch, file_path: &str) -> OaResu
         .unwrap_or_default();
 
     let count = workbooks.get("Count")
-        .and_then(|v| v.as_i32().map_err(|e| e))
+        .and_then(|v| v.as_i32())
         .unwrap_or(0);
 
     for i in 1..=count {
-        if let Ok(v) = workbooks.call("Item", &[Variant::from(i)]) {
-            if let Ok(d) = v.as_dispatch() {
+        if let Ok(v) = workbooks.call("Item", &[Variant::from(i)])
+            && let Ok(d) = v.as_dispatch() {
                 let mut wb = Dispatch::new(d);
                 let wb_name = wb.get("Name")
-                    .and_then(|v| v.as_string().map_err(|e| e))
+                    .and_then(|v| v.as_string())
                     .unwrap_or_default();
                 if wb_name.eq_ignore_ascii_case(&filename) {
                     return Ok(wb);
                 }
             }
-        }
     }
 
     // Not open — open it

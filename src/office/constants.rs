@@ -9,6 +9,7 @@ pub enum MsoShapeType {
 }
 
 /// PpUpdateOption — how OLE link updates are handled.
+#[allow(dead_code)]
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PpUpdateOption {
@@ -17,6 +18,7 @@ pub enum PpUpdateOption {
 }
 
 /// XlCalculation — Excel calculation mode.
+#[allow(dead_code)]
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XlCalculation {
@@ -33,6 +35,7 @@ pub enum MsoTriState {
 }
 
 /// PpAlertsLevel — PowerPoint alert display.
+#[allow(dead_code)]
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PpAlertsLevel {
@@ -41,6 +44,7 @@ pub enum PpAlertsLevel {
 }
 
 /// MsoFillType values.
+#[allow(dead_code)]
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsoFillType {

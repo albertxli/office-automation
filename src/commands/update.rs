@@ -262,7 +262,7 @@ fn resolve_file_pairs(args: &UpdateArgs) -> OaResult<Vec<FilePair>> {
     if !args.pair.is_empty() {
         for pair_str in &args.pair {
             let (pptx, xlsx) = parse_pair(pair_str)
-                .map_err(|e| OaError::Config(e))?;
+                .map_err(OaError::Config)?;
             pairs.push(FilePair {
                 pptx: PathBuf::from(&pptx),
                 excel: PathBuf::from(&xlsx),

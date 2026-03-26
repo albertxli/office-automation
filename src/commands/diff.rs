@@ -165,12 +165,12 @@ fn compare_inventories(a: &SlideInventory, b: &SlideInventory) -> Vec<Diff> {
 fn read_table_cell_11(shape: &Dispatch) -> String {
     let mut s = shape.clone();
     s.get("Table")
-        .and_then(|v| v.as_dispatch().map_err(|e| e))
+        .and_then(|v| v.as_dispatch())
         .and_then(|d| Dispatch::new(d).call("Cell", &[Variant::from(1i32), Variant::from(1i32)]))
-        .and_then(|v| v.as_dispatch().map_err(|e| e))
+        .and_then(|v| v.as_dispatch())
         .and_then(|d| Dispatch::new(d).nav("Shape.TextFrame.TextRange"))
         .and_then(|mut tr| tr.get("Text"))
-        .and_then(|v| v.as_string().map_err(|e| e))
+        .and_then(|v| v.as_string())
         .unwrap_or_default()
         .trim()
         .to_string()

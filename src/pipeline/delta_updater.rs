@@ -83,17 +83,17 @@ pub fn update_deltas(
             let mut delt_shape = delt_ref.dispatch.clone();
             let delt_base = strip_sign_suffix(&delt_ref.name).to_string();
 
-            let left = delt_shape.get("Left").and_then(|v| v.as_f64().map_err(|e| e)).unwrap_or(0.0);
-            let top = delt_shape.get("Top").and_then(|v| v.as_f64().map_err(|e| e)).unwrap_or(0.0);
-            let width = delt_shape.get("Width").and_then(|v| v.as_f64().map_err(|e| e)).unwrap_or(0.0);
-            let height = delt_shape.get("Height").and_then(|v| v.as_f64().map_err(|e| e)).unwrap_or(0.0);
+            let left = delt_shape.get("Left").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let top = delt_shape.get("Top").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let width = delt_shape.get("Width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let height = delt_shape.get("Height").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
             // Get OLE source link for Excel fallback
             let ole_source = {
                 let mut ole_shape = ole_ref.dispatch.clone();
                 ole_shape.nav("LinkFormat")
                     .and_then(|mut lf| lf.get("SourceFullName"))
-                    .and_then(|v| v.as_string().map_err(|e| e))
+                    .and_then(|v| v.as_string())
                     .unwrap_or_default()
             };
 
@@ -174,7 +174,7 @@ pub fn update_deltas(
 
         // The pasted shape is the last one
         let shape_count = slide_shapes.get("Count")
-            .and_then(|v| v.as_i32().map_err(|e| e))
+            .and_then(|v| v.as_i32())
             .unwrap_or(0);
 
         let new_variant = match slide_shapes.call("Item", &[Variant::from(shape_count)]) {
@@ -219,15 +219,15 @@ fn get_delta_value(
     if let Some(table_info) = inventory.tables.get(&key) {
         let mut tbl_shape = table_info.dispatch.clone();
         let value = tbl_shape.get("Table")
-            .and_then(|v| v.as_dispatch().map_err(|e| e))
+            .and_then(|v| v.as_dispatch())
             .and_then(|d| {
                 let mut tbl = Dispatch::new(d);
                 tbl.call("Cell", &[Variant::from(1i32), Variant::from(1i32)])
             })
-            .and_then(|v| v.as_dispatch().map_err(|e| e))
+            .and_then(|v| v.as_dispatch())
             .and_then(|d| Dispatch::new(d).nav("Shape.TextFrame.TextRange"))
             .and_then(|mut tr| tr.get("Text"))
-            .and_then(|v| v.as_string().map_err(|e| e))
+            .and_then(|v| v.as_string())
             .ok();
 
         if let Some(v) = value {
@@ -239,24 +239,23 @@ fn get_delta_value(
     }
 
     // Fallback: read from Excel (for delt-only OLE shapes with no table)
-    if let Some(excel) = excel_app {
-        if !item.ole_source_full.is_empty() && !excel_path.is_empty() {
+    if let Some(excel) = excel_app
+        && !item.ole_source_full.is_empty() && !excel_path.is_empty() {
             let parts = parse_source_full_name(&item.ole_source_full);
             if parts.range_address != "Not Specified" && parts.sheet_name != "Not Specified" {
                 // Use CLI excel_path, not the old SourceFullName path (GOTCHA #29)
                 if let Ok(mut workbooks) = excel.get("Workbooks")
-                    .and_then(|v| v.as_dispatch().map_err(|e| e))
+                    .and_then(|v| v.as_dispatch())
                     .map(Dispatch::new)
-                {
-                    if let Ok(mut wb) = crate::pipeline::table_updater::open_or_get_workbook(&mut workbooks, excel_path) {
+                    && let Ok(mut wb) = crate::pipeline::table_updater::open_or_get_workbook(&mut workbooks, excel_path) {
                         let cell_text = wb.get("Worksheets")
-                            .and_then(|v| v.as_dispatch().map_err(|e| e))
+                            .and_then(|v| v.as_dispatch())
                             .and_then(|d| Dispatch::new(d).call("Item", &[Variant::from(parts.sheet_name.as_str())]))
-                            .and_then(|v| v.as_dispatch().map_err(|e| e))
+                            .and_then(|v| v.as_dispatch())
                             .and_then(|d| Dispatch::new(d).call("Range", &[Variant::from(parts.range_address.as_str())]))
-                            .and_then(|v| v.as_dispatch().map_err(|e| e))
+                            .and_then(|v| v.as_dispatch())
                             .and_then(|d| Dispatch::new(d).get("Text"))
-                            .and_then(|v| v.as_string().map_err(|e| e))
+                            .and_then(|v| v.as_string())
                             .ok();
 
                         if let Some(text) = cell_text {
@@ -266,10 +265,8 @@ fn get_delta_value(
                             }
                         }
                     }
-                }
             }
         }
-    }
 
     None
 }
@@ -306,15 +303,15 @@ fn delete_old_delta(slide: &mut Dispatch, base_name: &str) {
     };
 
     let count = shapes.get("Count")
-        .and_then(|v| v.as_i32().map_err(|e| e))
+        .and_then(|v| v.as_i32())
         .unwrap_or(0);
 
     for i in 1..=count {
-        if let Ok(v) = shapes.call("Item", &[Variant::from(i)]) {
-            if let Ok(d) = v.as_dispatch() {
+        if let Ok(v) = shapes.call("Item", &[Variant::from(i)])
+            && let Ok(d) = v.as_dispatch() {
                 let mut shp = Dispatch::new(d);
                 let name = shp.get("Name")
-                    .and_then(|v| v.as_string().map_err(|e| e))
+                    .and_then(|v| v.as_string())
                     .unwrap_or_default();
 
                 if strip_sign_suffix(&name) == base_name {
@@ -322,7 +319,6 @@ fn delete_old_delta(slide: &mut Dispatch, base_name: &str) {
                     return; // Only delete the first match
                 }
             }
-        }
     }
 }
 

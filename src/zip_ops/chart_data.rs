@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 
+/// Series data: Vec of (range_ref, cached_values) per chart.
+type ChartSeriesData = Vec<(String, Vec<f64>)>;
+
 /// Result of chart data pre-update.
 pub struct ChartDataResult {
     pub charts_updated: usize,
@@ -252,7 +255,7 @@ fn rewrite_chart_cache(
                         in_num_cache = false;
                         current_range_ref.clear();
                         current_values = None;
-                        combined_values_buf = None;
+                        drop(combined_values_buf.take());
                     }
                     b"val" => { in_val = false; in_num_ref = false; in_num_cache = false; }
                     b"numRef" => { in_num_ref = false; in_num_cache = false; }
@@ -263,13 +266,13 @@ fn rewrite_chart_cache(
                         if let Some(vals) = current_values {
                             let start_idx = if !seen_pt_in_cache { 0 } else { max_pt_idx_seen };
                             if start_idx < vals.len() {
-                                for idx in start_idx..vals.len() {
+                                for (idx, val) in vals.iter().enumerate().skip(start_idx) {
                                     let mut pt_start = BytesStart::new("c:pt");
                                     pt_start.push_attribute(("idx", idx.to_string().as_str()));
                                     writer.write_event(Event::Start(pt_start)).map_err(|e| e.to_string())?;
 
                                     writer.write_event(Event::Start(BytesStart::new("c:v"))).map_err(|e| e.to_string())?;
-                                    writer.write_event(Event::Text(BytesText::new(&format!("{}", vals[idx])))).map_err(|e| e.to_string())?;
+                                    writer.write_event(Event::Text(BytesText::new(&format!("{}", val)))).map_err(|e| e.to_string())?;
                                     writer.write_event(Event::End(BytesEnd::new("c:v"))).map_err(|e| e.to_string())?;
 
                                     writer.write_event(Event::End(BytesEnd::new("c:pt"))).map_err(|e| e.to_string())?;
@@ -310,14 +313,13 @@ fn rewrite_chart_cache(
                     writer.write_event(Event::Text(t.clone())).map_err(|e| e.to_string())?;
                 } else if in_v && in_pt && in_num_cache {
                     // Replace the value if we have data
-                    if let Some(vals) = current_values {
-                        if current_pt_idx < vals.len() {
+                    if let Some(vals) = current_values
+                        && current_pt_idx < vals.len() {
                             let new_val = format!("{}", vals[current_pt_idx]);
                             let text = BytesText::new(&new_val);
                             writer.write_event(Event::Text(text)).map_err(|e| e.to_string())?;
                             continue;
                         }
-                    }
                     // No replacement — keep original
                     writer.write_event(Event::Text(t.clone())).map_err(|e| e.to_string())?;
                 } else {
@@ -497,13 +499,11 @@ pub fn extract_cached_values(xml: &str) -> Vec<(String, Vec<f64>)> {
             Ok(Event::Text(ref t)) => {
                 if in_f && in_num_ref && in_val {
                     current_ref = String::from_utf8_lossy(t.as_ref()).trim().to_string();
-                } else if in_v && in_pt && in_num_cache {
-                    if let Ok(val) = String::from_utf8_lossy(t.as_ref()).trim().parse::<f64>() {
-                        if current_pt_idx < current_values.len() {
+                } else if in_v && in_pt && in_num_cache
+                    && let Ok(val) = String::from_utf8_lossy(t.as_ref()).trim().parse::<f64>()
+                        && current_pt_idx < current_values.len() {
                             current_values[current_pt_idx] = val;
                         }
-                    }
-                }
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -518,12 +518,12 @@ pub fn extract_cached_values(xml: &str) -> Vec<(String, Vec<f64>)> {
 ///
 /// Returns: HashMap<(slide_num, chart_position) → Vec<(range_ref, cached_values)>>
 /// This matches the same key scheme as `build_chart_ref_map` in check.rs.
-pub fn read_all_chart_cache(pptx_path: &std::path::Path) -> Result<HashMap<String, Vec<(String, Vec<f64>)>>, String> {
+pub fn read_all_chart_cache(pptx_path: &std::path::Path) -> Result<HashMap<String, ChartSeriesData>, String> {
     let data = std::fs::read(pptx_path).map_err(|e| format!("Failed to read PPTX: {e}"))?;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&data))
         .map_err(|e| format!("Failed to open ZIP: {e}"))?;
 
-    let mut result: HashMap<String, Vec<(String, Vec<f64>)>> = HashMap::new();
+    let mut result: HashMap<String, ChartSeriesData> = HashMap::new();
 
     let chart_names: Vec<String> = (0..archive.len())
         .filter_map(|i| {

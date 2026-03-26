@@ -6,7 +6,6 @@
 //! GOTCHA #25: Some charts have IsLinked=True but SourceFullName="NULL" —
 //! these are broken links that we skip gracefully.
 
-use crate::com::dispatch::Dispatch;
 use crate::com::variant::Variant;
 use crate::error::OaResult;
 use crate::office::constants::PpUpdateOption;
@@ -40,7 +39,7 @@ pub fn update_charts(
 
         // GOTCHA #25: Check for broken links (SourceFullName = "NULL")
         let current_source = link_format.get("SourceFullName")
-            .and_then(|v| v.as_string().map_err(|e| e))
+            .and_then(|v| v.as_string())
             .unwrap_or_default();
 
         if current_source == "NULL" || current_source.is_empty() {

@@ -53,8 +53,10 @@ impl Drop for ComGuard {
 ///
 /// This struct documents the pattern — actual cleanup is done manually since
 /// the types involved (Dispatch, Variant) don't form a single owning hierarchy.
+#[allow(dead_code)]
 pub struct SessionCleanup;
 
+#[allow(dead_code)]
 impl SessionCleanup {
     /// Document: correct cleanup order for reference.
     pub const CLEANUP_ORDER: &'static str =

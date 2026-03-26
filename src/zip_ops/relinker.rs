@@ -12,7 +12,7 @@
 //! - UNC path support (Python bug #10)
 //! - Per-file error handling with context (Python bug #5)
 
-use std::io::{Read, Write, Seek};
+use std::io::{Read, Write};
 use std::path::Path;
 
 use crate::zip_ops::xml_stream::rewrite_xml_attributes;
