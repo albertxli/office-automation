@@ -16,19 +16,29 @@ Takes a PowerPoint template with linked OLE objects and Excel data, then updates
 
 Requires Windows with Microsoft Office (PowerPoint + Excel) installed.
 
-```bash
-cargo install office-automation
+### One-liner (no Rust needed)
+
+Download the latest `oa.exe` from [GitHub Releases](https://github.com/albertxli/office-automation/releases/latest) and place it in your PATH.
+
+**PowerShell:**
+```powershell
+irm https://github.com/albertxli/office-automation/releases/latest/download/oa.exe -OutFile "$env:USERPROFILE\.cargo\bin\oa.exe"
 ```
 
-Or build from source:
+**Git Bash / curl:**
+```bash
+curl -Lo "$HOME/.cargo/bin/oa.exe" https://github.com/albertxli/office-automation/releases/latest/download/oa.exe
+```
+
+### Build from source
 
 ```bash
-git clone https://github.com/user/office-automation.git
+git clone https://github.com/albertxli/office-automation.git
 cd office-automation
 cargo build --release
 ```
 
-The binary is `oa.exe` in `target/release/`.
+The binary is `target/release/oa.exe`.
 
 ## Quick Start
 
