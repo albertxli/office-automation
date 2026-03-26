@@ -1,6 +1,6 @@
 [package]
 name = "office-automation"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Windows CLI tool that automates PowerPoint and Excel via COM"
 license = "MIT"
