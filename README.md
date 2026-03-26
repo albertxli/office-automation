@@ -18,23 +18,14 @@ Requires Windows with Microsoft Office (PowerPoint + Excel) installed.
 
 ### One-liner (no Rust needed)
 
-Download the latest `oa.exe` from [GitHub Releases](https://github.com/albertxli/office-automation/releases/latest) and place it in your PATH.
-
 **PowerShell:**
 ```powershell
-New-Item -Force -ItemType Directory "$env:LOCALAPPDATA\oa" | Out-Null
-irm https://github.com/albertxli/office-automation/releases/latest/download/oa.exe -OutFile "$env:LOCALAPPDATA\oa\oa.exe"
-```
-Then add `%LOCALAPPDATA%\oa` to your PATH (one-time):
-```powershell
-[Environment]::SetEnvironmentVariable("Path", "$env:Path;$env:LOCALAPPDATA\oa", "User")
+powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/albertxli/office-automation/main/install.ps1 | iex"
 ```
 
-**Git Bash / curl:**
-```bash
-mkdir -p "$LOCALAPPDATA/oa"
-curl -Lo "$LOCALAPPDATA/oa/oa.exe" https://github.com/albertxli/office-automation/releases/latest/download/oa.exe
-```
+Downloads `oa.exe`, installs to `%LOCALAPPDATA%\oa`, and adds it to your PATH automatically. Restart your terminal after install.
+
+Or download manually from [GitHub Releases](https://github.com/albertxli/office-automation/releases/latest).
 
 ### Build from source
 
