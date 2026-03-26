@@ -22,12 +22,18 @@ Download the latest `oa.exe` from [GitHub Releases](https://github.com/albertxli
 
 **PowerShell:**
 ```powershell
-irm https://github.com/albertxli/office-automation/releases/latest/download/oa.exe -OutFile "$env:USERPROFILE\.cargo\bin\oa.exe"
+New-Item -Force -ItemType Directory "$env:LOCALAPPDATA\oa" | Out-Null
+irm https://github.com/albertxli/office-automation/releases/latest/download/oa.exe -OutFile "$env:LOCALAPPDATA\oa\oa.exe"
+```
+Then add `%LOCALAPPDATA%\oa` to your PATH (one-time):
+```powershell
+[Environment]::SetEnvironmentVariable("Path", "$env:Path;$env:LOCALAPPDATA\oa", "User")
 ```
 
 **Git Bash / curl:**
 ```bash
-curl -Lo "$HOME/.cargo/bin/oa.exe" https://github.com/albertxli/office-automation/releases/latest/download/oa.exe
+mkdir -p "$LOCALAPPDATA/oa"
+curl -Lo "$LOCALAPPDATA/oa/oa.exe" https://github.com/albertxli/office-automation/releases/latest/download/oa.exe
 ```
 
 ### Build from source
