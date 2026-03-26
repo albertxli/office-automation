@@ -27,15 +27,19 @@ Downloads `oa.exe`, installs to `%LOCALAPPDATA%\oa`, and adds it to your PATH au
 
 Or download manually from [GitHub Releases](https://github.com/albertxli/office-automation/releases/latest).
 
+### Via crates.io (requires Rust)
+
+```bash
+cargo install office-automation
+```
+
 ### Build from source
 
 ```bash
 git clone https://github.com/albertxli/office-automation.git
 cd office-automation
-cargo build --release
+cargo install --path .
 ```
-
-The binary is `target/release/oa.exe`.
 
 ## Quick Start
 

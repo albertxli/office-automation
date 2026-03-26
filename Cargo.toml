@@ -2,6 +2,11 @@
 name = "office-automation"
 version = "0.1.0"
 edition = "2024"
+description = "Windows CLI tool that automates PowerPoint and Excel via COM"
+license = "MIT"
+repository = "https://github.com/albertxli/office-automation"
+keywords = ["powerpoint", "excel", "office", "com", "automation"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "oa"
