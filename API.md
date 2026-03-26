@@ -140,7 +140,7 @@ oa run <RUNFILE.toml> [OPTIONS]
 
 ```toml
 # output/{name}.pptx — {name} is replaced with the job key
-default_output = "output/rpm_2024_{name}.pptx"
+default_output = "output/{name}.pptx"
 
 # Optional: limit which pipeline steps run (default: all)
 steps = ["links", "tables", "deltas", "coloring", "charts"]
@@ -152,18 +152,18 @@ links.set_manual = true
 
 # Jobs: template path → { job_name = excel_path }
 [jobs."templates/region1_template.pptx"]
-australia = "data/rpm_tracking_Australia.xlsx"
-japan = "data/rpm_tracking_Japan.xlsx"
-indonesia = "data/rpm_tracking_Indonesia.xlsx"
+australia = "data/tracking_australia.xlsx"
+japan = "data/tracking_japan.xlsx"
+indonesia = "data/tracking_indonesia.xlsx"
 
 [jobs."templates/region2_template.pptx"]
-germany = "data/rpm_tracking_Germany.xlsx"
-france = "data/rpm_tracking_France.xlsx"
+germany = "data/tracking_germany.xlsx"
+france = "data/tracking_france.xlsx"
 
 # Per-job output override (use inline table)
 [jobs."templates/special_template.pptx"]
-usa = "data/usa.xlsx"
-canada = { data = "data/canada.xlsx", output = "special/canada_report.pptx" }
+usa = "data/tracking_usa.xlsx"
+canada = { data = "data/tracking_canada.xlsx", output = "special/canada_report.pptx" }
 ```
 
 **Examples:**
@@ -189,7 +189,7 @@ Runfile: batch.toml (26 jobs)
 
 --- Job 1/26: Argentina ---
   ▸ template.pptx
-    ← rpm_tracking_Argentina.xlsx
+    ← tracking_argentina.xlsx
   ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
   • Relink ·······················  411   0.1s
   • Tables ·······················  155   1.2s
@@ -321,7 +321,7 @@ oa info template.pptx
   Slides ·······································   68
 
   OLE links ····································  155
-    ╰ rpm_tracking_Portugal_(05_09).xlsx ·······  155
+    ╰ tracking_data.xlsx ························  155
 
   Charts ·······································  258
     ╰ Linked ···································  257
