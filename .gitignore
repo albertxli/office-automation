@@ -2,6 +2,19 @@
 /output
 /excel_test_data
 /quick_test_files
-example_runfile.py
-test_runfile.py
+/oa_run_test
+/legacy
+/.claude
 *.pdb
+
+# Internal files
+CLAUDE.md
+CLI_DESIGN_SPEC_V3.md
+LOCAL_TESTING.md
+plan.md
+test_runfile.toml
+test_runfile.py
+example_runfile.py
+cli_print_design/
+initial migration message prompt.md
+PPTX_DATA_ARCHITECTURE.md

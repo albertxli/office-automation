@@ -1,0 +1,48 @@
+# Example runfile for `oa run`
+#
+# Usage: oa run example_runfile.toml
+#
+# This file defines batch jobs. Each job links a template PPTX
+# to an Excel data file and produces an output PPTX.
+
+# Prepended to relative data paths in [[job]] entries
+data_path = "../data"
+
+# Output path template — {name} is replaced with the job name
+default_output = "output/{name}.pptx"
+
+# Template aliases (short names for template files)
+[templates]
+t1 = "templates/market_report_template.pptx"
+
+# Optional: only run specific pipeline steps (default: all)
+# steps = ["links", "tables", "deltas", "coloring", "charts"]
+
+# Optional: config overrides
+# [config]
+# ccst.positive_prefix = ""
+# links.set_manual = true
+
+# --- Jobs ---
+
+[[job]]
+name = "Australia"
+template = "t1"
+data = "tracking_australia.xlsx"
+
+[[job]]
+name = "Japan"
+template = "t1"
+data = "tracking_japan.xlsx"
+
+[[job]]
+name = "Germany"
+template = "t1"
+data = "tracking_germany.xlsx"
+
+# Per-job output override
+[[job]]
+name = "United_States"
+template = "t1"
+data = "tracking_united_states.xlsx"
+output = "special/us_report.pptx"
