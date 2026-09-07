@@ -34,7 +34,7 @@ pub fn classify_shape_name(name: &str) -> Option<ShapePrefix> {
         Some(ShapePrefix::Heatmap)
     } else if name.contains("trns_") {
         Some(ShapePrefix::Transposed)
-    } else if name.contains("delt_") {
+    } else if delta_set(name).is_some() {
         Some(ShapePrefix::Delta)
     } else if name.contains("_ccst") {
         Some(ShapePrefix::ColorCoded)
@@ -106,6 +106,64 @@ pub fn strip_sign_suffix(name: &str) -> &str {
         }
     }
     name
+}
+
+/// Extract the delta template-set number from a shape name.
+///
+/// Recognises `delt` followed by an optional run of ASCII digits and an underscore,
+/// anywhere in the name (mirrors the historical `contains("delt_")` check):
+/// - `delt_Rev`   → `Some(1)` (default set)
+/// - `delt1_Rev`  → `Some(1)` (explicit alias of set 1)
+/// - `delt2_Rev`  → `Some(2)`, `delt12_Rev` → `Some(12)`
+/// - `delt0_Rev`, `delta_Rev`, `delt2Rev` → `None`
+///
+/// Set N pairs with templates named by [`template_name_for_set`].
+pub fn delta_set(name: &str) -> Option<u32> {
+    let bytes = name.as_bytes();
+    let mut search = 0;
+
+    while let Some(found) = name[search..].find("delt") {
+        let start = search + found + 4; // byte index just past "delt"
+        let digits_end = bytes[start..]
+            .iter()
+            .position(|b| !b.is_ascii_digit())
+            .map_or(bytes.len(), |p| start + p);
+
+        if bytes.get(digits_end) == Some(&b'_') {
+            let digits = &name[start..digits_end];
+            if digits.is_empty() {
+                return Some(1);
+            }
+            if let Ok(n) = digits.parse::<u32>()
+                && n >= 1
+            {
+                return Some(n);
+            }
+        }
+
+        search = search + found + 1;
+        if search >= bytes.len() {
+            break;
+        }
+    }
+
+    None
+}
+
+/// Derive the template shape name for a given delta set.
+///
+/// - Set 1 returns `base` unchanged (the configured `tmpl_delta_*` name).
+/// - Set N ≥ 2 replaces a leading `tmpl_` with `tmpl<N>_`, e.g.
+///   `tmpl_delta_pos` → `tmpl2_delta_pos`. If `base` has no `tmpl_` prefix
+///   (custom override), falls back to `tmpl<N>_delta_<sign>`.
+pub fn template_name_for_set(base: &str, set: u32, sign: &str) -> String {
+    if set <= 1 {
+        return base.to_string();
+    }
+    match base.strip_prefix("tmpl_") {
+        Some(rest) => format!("tmpl{set}_{rest}"),
+        None => format!("tmpl{set}_delta_{sign}"),
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +292,87 @@ mod tests {
     #[test]
     fn test_strip_no_suffix() {
         assert_eq!(strip_sign_suffix("delt_Growth"), "delt_Growth");
+    }
+
+    #[test]
+    fn test_strip_numbered_set() {
+        assert_eq!(strip_sign_suffix("delt2_Growth_neg"), "delt2_Growth");
+        assert_eq!(strip_sign_suffix("delt12_Growth_none"), "delt12_Growth");
+    }
+
+    // --- delta_set tests ---
+
+    #[test]
+    fn test_delta_set_default() {
+        assert_eq!(delta_set("delt_Growth_pos"), Some(1));
+        assert_eq!(delta_set("delt_"), Some(1));
+    }
+
+    #[test]
+    fn test_delta_set_explicit_one_is_alias() {
+        assert_eq!(delta_set("delt1_Growth_pos"), Some(1));
+    }
+
+    #[test]
+    fn test_delta_set_numbered() {
+        assert_eq!(delta_set("delt2_Growth_pos"), Some(2));
+        assert_eq!(delta_set("delt9_Growth"), Some(9));
+        assert_eq!(delta_set("delt12_Growth_none"), Some(12));
+        assert_eq!(delta_set("delt250_X"), Some(250));
+    }
+
+    #[test]
+    fn test_delta_set_anywhere_in_name() {
+        // Mirrors the old contains("delt_") semantics
+        assert_eq!(delta_set("Group delt_Growth"), Some(1));
+        assert_eq!(delta_set("Xdelt2_Growth"), Some(2));
+    }
+
+    #[test]
+    fn test_delta_set_zero_rejected() {
+        assert_eq!(delta_set("delt0_Growth"), None);
+    }
+
+    #[test]
+    fn test_delta_set_not_a_delta() {
+        assert_eq!(delta_set("delta_Growth"), None);
+        assert_eq!(delta_set("delt2Growth"), None);
+        assert_eq!(delta_set("delt"), None);
+        assert_eq!(delta_set("ntbl_Growth"), None);
+        assert_eq!(delta_set(""), None);
+    }
+
+    #[test]
+    fn test_delta_set_skips_bad_then_finds_good() {
+        // First "delt" has no underscore after digits; second one is valid
+        assert_eq!(delta_set("deltX_delt2_Growth"), Some(2));
+    }
+
+    #[test]
+    fn test_classify_numbered_delt() {
+        assert_eq!(classify_shape_name("delt2_Growth_pos"), Some(ShapePrefix::Delta));
+        assert_eq!(classify_shape_name("delt1_Growth_pos"), Some(ShapePrefix::Delta));
+        assert_eq!(classify_shape_name("delt0_Growth_pos"), None);
+    }
+
+    // --- template_name_for_set tests ---
+
+    #[test]
+    fn test_template_name_set_one_unchanged() {
+        assert_eq!(template_name_for_set("tmpl_delta_pos", 1, "pos"), "tmpl_delta_pos");
+        assert_eq!(template_name_for_set("custom_up", 1, "pos"), "custom_up");
+    }
+
+    #[test]
+    fn test_template_name_numbered() {
+        assert_eq!(template_name_for_set("tmpl_delta_pos", 2, "pos"), "tmpl2_delta_pos");
+        assert_eq!(template_name_for_set("tmpl_delta_neg", 2, "neg"), "tmpl2_delta_neg");
+        assert_eq!(template_name_for_set("tmpl_delta_none", 12, "none"), "tmpl12_delta_none");
+    }
+
+    #[test]
+    fn test_template_name_custom_base_falls_back() {
+        assert_eq!(template_name_for_set("custom_up", 2, "pos"), "tmpl2_delta_pos");
     }
 
     // --- prefix_to_table_type tests ---

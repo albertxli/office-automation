@@ -69,6 +69,9 @@ When scanning grouped shapes, check the **group's name** for `delt_` prefix BEFO
 ### #17 Inventory Key by Slide
 Shape names can be duplicated across slides (e.g., two slides both have an OLE named `Table_Revenue`). Key the inventory by `(slide_index, shape_name)` tuple, not just shape name.
 
+### #42 Numbered Delta Template Sets (Rust-specific)
+A delta shape's template set is derived from its name: `delt_` / `delt1_` = set 1 (the configured `tmpl_delta_*` names), `delt<N>_` = set N, which copies from `tmpl<N>_delta_{pos,neg,none}` on the same template slide. Always detect deltas with `matcher::delta_set(name)`, never `contains("delt_")` — the literal misses `delt2_`. If any template of a set is missing, that set is skipped with a warning; it must never fall back to set 1 (that would paste the wrong arrow style silently). Unchanged limitation: one delta shape per OLE per slide — a second `delt*_` shape naming the same OLE on the same slide is never paired, updated, or checked.
+
 ## Table Operations
 
 ### #7 Float Precision in Contrast Color

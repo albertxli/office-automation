@@ -376,7 +376,7 @@ oa diff <A.pptx> <B.pptx> [-v]
 ```
 
 **What it compares:**
-- Shape inventory counts (ntbl_, htmp_, trns_, delt_, _ccst)
+- Shape inventory counts (ntbl_, htmp_, trns_, delt_, _ccst); numbered delta sets (`delt2_`, ...) get their own count row and `tmpl<N>_delta_*` template rows when present
 - Table cell values for matching shapes
 - Chart counts
 
@@ -480,11 +480,13 @@ The pipeline identifies shapes by name prefix/suffix:
 | `ntbl_` | Normal table | Preserves formatting, only updates cell text |
 | `htmp_` | Heatmap table | Recalculates 3-color scale from Excel |
 | `trns_` | Transposed table | Swaps rows/columns from Excel range |
-| `delt_` | Delta indicator | Arrow shape, swapped based on value sign |
+| `delt_` | Delta indicator | Arrow shape, swapped based on value sign (set 1; `delt1_` is an alias) |
+| `delt<N>_` | Delta indicator, set N | Same behaviour, copies from `tmpl<N>_delta_*` (N ≥ 2, e.g. `delt2_Rev_DE_pos`) |
 | `_ccst` | Color-coded table | Cells colored by sign (positive/negative/neutral) |
 | `tmpl_delta_pos` | Template | Positive delta arrow template on slide 1 |
 | `tmpl_delta_neg` | Template | Negative delta arrow template on slide 1 |
 | `tmpl_delta_none` | Template | Neutral delta template on slide 1 |
+| `tmpl<N>_delta_pos` / `_neg` / `_none` | Template, set N | Templates for `delt<N>_` shapes, same slide as set 1. A set with any template missing is skipped with a warning, never mapped to set 1. |
 
 **Shape-OLE matching:** Table names like `ntbl_Object 1_ccst` are matched to OLE shapes like `Object 1` using word-boundary token matching (the `ntbl_` prefix and `_ccst` suffix are stripped during matching).
 

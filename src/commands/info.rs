@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::error::OaResult;
 use crate::office::constants::MsoTriState;
 use crate::shapes::inventory::build_inventory;
+use crate::shapes::matcher::{delta_set, template_name_for_set};
 use crate::utils::link_parser::extract_file_path;
 
 /// Per-slide shape counts for verbose output.
@@ -95,6 +96,34 @@ pub fn run_info(pptx_path: &str, verbose: bool) -> OaResult<()> {
         template_found.push((name.to_string(), found));
     }
 
+    // Numbered delta sets (delt2_, delt3_, ...) present in the deck.
+    // Each set N ≥ 2 needs its own tmpl<N>_delta_* triple on the template slide.
+    let mut extra_sets: Vec<u32> = inventory.delts.values()
+        .filter_map(|d| delta_set(&d.name))
+        .filter(|&s| s >= 2)
+        .collect();
+    extra_sets.sort_unstable();
+    extra_sets.dedup();
+
+    let extra_set_counts: Vec<(u32, usize)> = extra_sets.iter().map(|&set| {
+        let n = inventory.delts.values()
+            .filter(|d| delta_set(&d.name) == Some(set))
+            .count();
+        (set, n)
+    }).collect();
+
+    for &set in &extra_sets {
+        let derived = [
+            template_name_for_set(&config.delta.template_positive, set, "pos"),
+            template_name_for_set(&config.delta.template_negative, set, "neg"),
+            template_name_for_set(&config.delta.template_none, set, "none"),
+        ];
+        for name in derived {
+            let found = find_template_shape(&mut presentation, &name, 1);
+            template_found.push((name, found));
+        }
+    }
+
     // Count unlinked charts
     let unlinked_charts = count_unlinked_charts(&mut presentation);
 
@@ -166,6 +195,9 @@ pub fn run_info(pptx_path: &str, verbose: bool) -> OaResult<()> {
     info_row("htmp_ heatmap tables", inventory.count_htmp, true);
     info_row("trns_ transposed tables", inventory.count_trns, true);
     info_row("delt_ delta indicators", inventory.count_delt, true);
+    for (set, n) in &extra_set_counts {
+        info_row(&format!("delt{set}_ delta indicators (set {set})"), *n, true);
+    }
     info_row("_ccst color-coded", inventory.count_ccst, true);
 
     // Delta templates

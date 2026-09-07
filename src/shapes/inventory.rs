@@ -209,7 +209,7 @@ fn scan_shape_recursive(
     // Group shapes
     if shape_type == MsoShapeType::Group as i32 {
         // GOTCHA #13: Check the group's name for delt_ BEFORE recursing
-        if name.contains("delt_") {
+        if matcher::delta_set(&name).is_some() {
             delt_candidates.push(DeltCandidate {
                 slide_index,
                 dispatch: shape.clone(),
@@ -260,7 +260,7 @@ fn scan_shape_recursive(
                 }
             }
         // delt_ check for non-group OLE shapes still needed
-        if name.contains("delt_") {
+        if matcher::delta_set(&name).is_some() {
             delt_candidates.push(DeltCandidate {
                 slide_index,
                 dispatch: shape.clone(),
@@ -327,7 +327,7 @@ fn scan_shape_recursive(
     }
 
     // delt_ candidates (non-group shapes)
-    if name.contains("delt_") && shape_type != MsoShapeType::Group as i32 {
+    if matcher::delta_set(&name).is_some() && shape_type != MsoShapeType::Group as i32 {
         delt_candidates.push(DeltCandidate {
             slide_index,
             dispatch: shape.clone(),

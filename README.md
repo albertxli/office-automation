@@ -129,7 +129,25 @@ The pipeline identifies shapes by name prefix:
 | `htmp_` | Heatmap table | Applies 3-color scale from Excel |
 | `trns_` | Transposed table | Swaps rows/columns from Excel |
 | `delt_` | Delta indicator | Arrow swapped by value sign |
+| `delt<N>_` | Delta indicator, set N | Same as `delt_`, but copies from the `tmpl<N>_delta_*` templates |
 | `_ccst` | Color-coded | Cells colored positive/negative/neutral |
+
+### Multiple delta template sets
+
+Delta arrows are replaced by copying a template shape from slide 1. When a deck needs
+more than one arrow style (for example arrows with text on most slides and text-free
+arrows on a few), number the set on both sides:
+
+| Set | Shape prefix | Templates on slide 1 |
+|-----|--------------|----------------------|
+| 1 | `delt_` (or `delt1_`) | `tmpl_delta_pos`, `tmpl_delta_neg`, `tmpl_delta_none` |
+| 2 | `delt2_` | `tmpl2_delta_pos`, `tmpl2_delta_neg`, `tmpl2_delta_none` |
+| N | `delt<N>_` | `tmpl<N>_delta_pos`, `tmpl<N>_delta_neg`, `tmpl<N>_delta_none` |
+
+The OLE name and the `_pos/_neg/_none` suffix work exactly as for `delt_`, e.g.
+`delt2_Rev_DE_pos`. If a set's templates are missing, that set is skipped with a
+warning and other sets still update. `oa info` lists every set found and its templates;
+`oa check` validates all sets.
 
 ## Performance
 

@@ -6,14 +6,28 @@
 //!
 //! Value sign is determined from the PPT table cell (primary) or Excel (fallback).
 //! Template shapes on slide 1: tmpl_delta_pos, tmpl_delta_neg, tmpl_delta_none.
+//!
+//! Template sets: a `delt<N>_` shape (N ≥ 2) copies from `tmpl<N>_delta_{pos,neg,none}`
+//! instead of the set-1 templates. Set number comes from `matcher::delta_set`; template
+//! names from `matcher::template_name_for_set`. A set whose templates are missing is
+//! skipped with a warning — never silently mapped to set 1.
+
+use std::collections::HashMap;
 
 use crate::com::dispatch::Dispatch;
 use crate::com::variant::Variant;
 use crate::config::Config;
 use crate::error::OaResult;
 use crate::shapes::inventory::SlideInventory;
-use crate::shapes::matcher::strip_sign_suffix;
+use crate::shapes::matcher::{delta_set, strip_sign_suffix, template_name_for_set};
 use crate::utils::link_parser::parse_source_full_name;
+
+/// The three template shapes for one delta set.
+struct TemplateTriple {
+    pos: Dispatch,
+    neg: Dispatch,
+    none: Dispatch,
+}
 
 /// Metadata collected in Pass 1 for processing in Pass 2.
 struct DeltaItem {
@@ -21,6 +35,7 @@ struct DeltaItem {
     ole_name: String,
     ole_source_full: String,
     delt_base_name: String, // Name with _pos/_neg/_none suffix stripped
+    set: u32,               // Template set number (1 = default tmpl_delta_*)
     delt_left: f64,
     delt_top: f64,
     delt_width: f64,
@@ -57,16 +72,7 @@ pub fn update_deltas(
     excel_path: &str,
     excel_app: &mut Dispatch,
 ) -> OaResult<usize> {
-    // Find template shapes on slide 1
     let template_slide = config.delta.template_slide;
-    let tmpl_pos = find_template(presentation, &config.delta.template_positive, template_slide);
-    let tmpl_neg = find_template(presentation, &config.delta.template_negative, template_slide);
-    let tmpl_none = find_template(presentation, &config.delta.template_none, template_slide);
-
-    let (Some(mut tmpl_pos), Some(mut tmpl_neg), Some(mut tmpl_none)) = (tmpl_pos, tmpl_neg, tmpl_none) else {
-        eprintln!("Warning: missing delta template shapes on slide {} — skipping deltas", template_slide);
-        return Ok(0);
-    };
 
     // --- Pass 1: Collect metadata ---
     let mut items: Vec<DeltaItem> = Vec::new();
@@ -82,6 +88,7 @@ pub fn update_deltas(
 
             let mut delt_shape = delt_ref.dispatch.clone();
             let delt_base = strip_sign_suffix(&delt_ref.name).to_string();
+            let set = delta_set(&delt_ref.name).unwrap_or(1);
 
             let left = delt_shape.get("Left").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let top = delt_shape.get("Top").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -102,6 +109,7 @@ pub fn update_deltas(
                 ole_name: ole_ref.name.clone(),
                 ole_source_full: ole_source,
                 delt_base_name: delt_base,
+                set,
                 delt_left: left,
                 delt_top: top,
                 delt_width: width,
@@ -114,11 +122,48 @@ pub fn update_deltas(
         return Ok(0);
     }
 
+    // --- Resolve template triples for every set present ---
+    // One scan of the template slide, then per-set lookup by derived name.
+    let slide_shapes_by_name = collect_slide_shapes_by_name(presentation, template_slide);
+    let mut templates: HashMap<u32, TemplateTriple> = HashMap::new();
+
+    let mut sets_present: Vec<u32> = items.iter().map(|i| i.set).collect();
+    sets_present.sort_unstable();
+    sets_present.dedup();
+
+    for set in sets_present {
+        match resolve_template_set(&slide_shapes_by_name, config, set) {
+            Ok(triple) => {
+                templates.insert(set, triple);
+            }
+            Err(missing) => {
+                if set == 1 {
+                    eprintln!("Warning: missing delta template shapes on slide {} — skipping deltas", template_slide);
+                } else {
+                    eprintln!(
+                        "Warning: missing delta template shapes for set {set} on slide {} ({}) — skipping delt{set}_ deltas",
+                        template_slide,
+                        missing.join(", ")
+                    );
+                }
+            }
+        }
+    }
+
+    if templates.is_empty() {
+        return Ok(0);
+    }
+
     // --- Pass 2: Process each delta ---
     let mut slides = Dispatch::new(presentation.get("Slides")?.as_dispatch()?);
     let mut count = 0;
 
     for item in &items {
+        // Skip items whose template set is unavailable (already warned above)
+        let Some(triple) = templates.get_mut(&item.set) else {
+            continue;
+        };
+
         // Get the cell value (primary: from PPT table, fallback: from Excel)
         let cell_value = get_delta_value(
             inventory,
@@ -135,11 +180,11 @@ pub fn update_deltas(
             _ => "none",
         };
 
-        // Pick template by sign
+        // Pick template by set, then by sign
         let template = match sign {
-            "pos" => &mut tmpl_pos,
-            "neg" => &mut tmpl_neg,
-            _ => &mut tmpl_none,
+            "pos" => &mut triple.pos,
+            "neg" => &mut triple.neg,
+            _ => &mut triple.none,
         };
 
         // Get slide
@@ -196,14 +241,80 @@ pub fn update_deltas(
 
         count += 1;
         let display_value = cell_value.as_deref().unwrap_or("(empty)");
-        super::verbose::detail(
-            item.slide_index,
-            &item.delt_base_name,
-            &format!("{display_value} → {sign}"),
-        );
+        let detail = if item.set == 1 {
+            format!("{display_value} → {sign}")
+        } else {
+            format!("{display_value} → {sign} (set {})", item.set)
+        };
+        super::verbose::detail(item.slide_index, &item.delt_base_name, &detail);
     }
 
     Ok(count)
+}
+
+/// Resolve the three template shapes for `set` from the pre-scanned template slide.
+///
+/// Set 1 uses the configured names verbatim; set N ≥ 2 derives `tmpl<N>_delta_*`
+/// via `template_name_for_set`. On failure returns the list of missing names.
+fn resolve_template_set(
+    shapes_by_name: &HashMap<String, Dispatch>,
+    config: &Config,
+    set: u32,
+) -> Result<TemplateTriple, Vec<String>> {
+    let name_pos = template_name_for_set(&config.delta.template_positive, set, "pos");
+    let name_neg = template_name_for_set(&config.delta.template_negative, set, "neg");
+    let name_none = template_name_for_set(&config.delta.template_none, set, "none");
+
+    let mut missing = Vec::new();
+    for n in [&name_pos, &name_neg, &name_none] {
+        if !shapes_by_name.contains_key(n.as_str()) {
+            missing.push(n.clone());
+        }
+    }
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+
+    Ok(TemplateTriple {
+        pos: shapes_by_name[&name_pos].clone(),
+        neg: shapes_by_name[&name_neg].clone(),
+        none: shapes_by_name[&name_none].clone(),
+    })
+}
+
+/// Scan one slide once and index its top-level shapes by name.
+///
+/// Returns an empty map if the slide cannot be read (caller reports missing templates).
+fn collect_slide_shapes_by_name(presentation: &mut Dispatch, slide_index: i32) -> HashMap<String, Dispatch> {
+    let mut map = HashMap::new();
+
+    let Some(mut shapes) = presentation.get("Slides").ok()
+        .and_then(|v| v.as_dispatch().ok())
+        .map(Dispatch::new)
+        .and_then(|mut slides| slides.call("Item", &[Variant::from(slide_index)]).ok())
+        .and_then(|v| v.as_dispatch().ok())
+        .map(Dispatch::new)
+        .and_then(|mut slide| slide.get("Shapes").ok())
+        .and_then(|v| v.as_dispatch().ok())
+        .map(Dispatch::new)
+    else {
+        return map;
+    };
+
+    let count = shapes.get("Count").and_then(|v| v.as_i32()).unwrap_or(0);
+    for i in 1..=count {
+        if let Ok(v) = shapes.call("Item", &[Variant::from(i)])
+            && let Ok(d) = v.as_dispatch()
+        {
+            let mut shape = Dispatch::new(d);
+            if let Ok(name) = shape.get("Name").and_then(|v| v.as_string()) {
+                // First occurrence wins, matching the old find_template linear scan
+                map.entry(name).or_insert(shape);
+            }
+        }
+    }
+
+    map
 }
 
 /// Try to read the delta value from the associated PPT table, then fall back to Excel.
@@ -267,27 +378,6 @@ fn get_delta_value(
                     }
             }
         }
-
-    None
-}
-
-/// Find a template shape by name on the specified slide.
-fn find_template(presentation: &mut Dispatch, name: &str, slide_index: i32) -> Option<Dispatch> {
-    let mut slides = Dispatch::new(presentation.get("Slides").ok()?.as_dispatch().ok()?);
-    let slide_variant = slides.call("Item", &[Variant::from(slide_index)]).ok()?;
-    let mut slide = Dispatch::new(slide_variant.as_dispatch().ok()?);
-
-    let mut shapes = Dispatch::new(slide.get("Shapes").ok()?.as_dispatch().ok()?);
-    let count = shapes.get("Count").ok()?.as_i32().ok()?;
-
-    for i in 1..=count {
-        let shape_variant = shapes.call("Item", &[Variant::from(i)]).ok()?;
-        let mut shape = Dispatch::new(shape_variant.as_dispatch().ok()?);
-        let shape_name = shape.get("Name").ok()?.as_string().ok()?;
-        if shape_name == name {
-            return Some(shape);
-        }
-    }
 
     None
 }

@@ -639,6 +639,9 @@ fn check_tables(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path
 
 // ── Delta checking ──────────────────────────────────────────
 
+/// Validate delta arrows: the shape's trailing `_pos/_neg/_none` must match the sign of
+/// the linked Excel cell. Works for every template set (`delt_`, `delt2_`, ...) because
+/// set recognition lives in the inventory (`matcher::delta_set`) and only the suffix is read here.
 fn check_deltas(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path: &str, result: &mut CheckResult) {
     let mut workbooks = match excel_app.get("Workbooks").and_then(|v| v.as_dispatch()).map(Dispatch::new) {
         Ok(wb) => wb, Err(_) => return,
