@@ -67,7 +67,7 @@ pub fn check_detail(slide: i32, check_type: &str, shape: &str, passed: bool, inf
 /// Format: `           ╰ 'Series1'  3/4 differ   .28→.26  .47→.56  ...`
 /// Coloring: ╰=dim, name=yellow, count=dim, PPT=red, →=dim, Excel=white.bold, ...=dim
 /// `name_pad` aligns diff counts across series within the same chart.
-pub fn check_chart_series_diff(name: &str, name_pad: usize, diff_count: usize, total: usize, pairs: &[(f64, f64)], has_more: bool) {
+pub fn check_chart_series_diff(name: &str, name_pad: usize, diff_count: usize, total: usize, pairs: &[(Option<f64>, Option<f64>)], has_more: bool) {
     if !is_verbose() {
         return;
     }
@@ -80,9 +80,9 @@ pub fn check_chart_series_diff(name: &str, name_pad: usize, diff_count: usize, t
     let mut pair_strs = Vec::new();
     for (ppt, excel) in pairs {
         pair_strs.push(format!("{}{}{}",
-            s_ppt.apply_to(fmt_short(*ppt)),
+            s_ppt.apply_to(fmt_short_opt(*ppt)),
             s_arrow.apply_to("→"),
-            s_excel.apply_to(fmt_short(*excel))));
+            s_excel.apply_to(fmt_short_opt(*excel))));
     }
     let values = pair_strs.join("  ");
     let overflow = if has_more { format!("  {}", s_dim.apply_to("...")) } else { String::new() };
@@ -115,6 +115,14 @@ pub fn truncate_middle(name: &str) -> String {
 }
 
 /// Format a float compactly: drop leading zero for decimals (0.28 → .28).
+/// Chart value for diff lines: `None` (no point / blank cell) prints as `(blank)`.
+fn fmt_short_opt(v: Option<f64>) -> String {
+    match v {
+        Some(x) => fmt_short(x),
+        None => "(blank)".to_string(),
+    }
+}
+
 fn fmt_short(v: f64) -> String {
     let s = format!("{v:.2}");
     if s.starts_with("0.") {

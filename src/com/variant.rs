@@ -16,6 +16,11 @@ use crate::error::{OaError, OaResult};
 const VT_ARRAY: u16 = 0x2000;
 const VT_R8: u16 = 5;
 const VT_VARIANT: u16 = 12;
+// VARENUM tags that mean "no value" for chart data (GOTCHA #43).
+const VT_EMPTY_TAG: u16 = 0;
+const VT_NULL_TAG: u16 = 1;
+const VT_BSTR_TAG: u16 = 8;
+const VT_ERROR_TAG: u16 = 10;
 
 /// A value extracted from a SAFEARRAY element (Range.Value2 or Series.Values).
 #[allow(dead_code)]
@@ -53,6 +58,7 @@ impl Variant {
     }
 
     /// Check if this variant is empty (VT_EMPTY).
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -91,6 +97,7 @@ impl Variant {
     }
 
     /// Try to coerce to a numeric value (i32 or f64 → f64).
+    #[allow(dead_code)]
     pub fn as_numeric(&self) -> OaResult<f64> {
         // Try f64 first, then i32
         if let Ok(v) = self.as_f64() {
@@ -159,70 +166,57 @@ impl Variant {
         }
     }
 
-    /// Extract a flat Vec<f64> from any numeric VARIANT — scalar or array.
+    /// Extract a flat `Vec<Option<f64>>` from a numeric VARIANT — scalar or array.
     ///
-    /// Handles:
-    /// - Scalar (VT_R8, VT_I4, VT_EMPTY) → vec![value]
-    /// - 1D VT_ARRAY|VT_R8 → direct f64 array read
-    /// - 1D/2D VT_ARRAY|VT_VARIANT → per-element extraction, flattened row-by-row
-    pub fn as_flat_f64_vec(&self) -> OaResult<Vec<f64>> {
+    /// Handles scalars, `VT_ARRAY|VT_R8` and 1D/2D `VT_ARRAY|VT_VARIANT` (Range.Value2),
+    /// flattened row-by-row, and preserves "no value":
+    /// blank cells (VT_EMPTY/VT_NULL), error cells (`#N/A`, VT_ERROR) and
+    /// non-numeric text become `None`; a real `0` is `Some(0.0)`.
+    ///
+    /// Used by the chart pipeline so a blank Excel cell produces *no* chart point
+    /// instead of a zero-height bar (GOTCHA #43). Not used by OLE/table code.
+    pub fn as_flat_opt_f64_vec(&self) -> OaResult<Vec<Option<f64>>> {
         if !self.is_array() {
-            // Scalar: wrap in single-element vec
-            if self.is_empty() {
-                return Ok(vec![0.0]);
-            }
-            return Ok(vec![self.as_numeric()?]);
+            return Ok(vec![variant_to_opt_f64(&self.0)]);
         }
 
         let elem_vt = self.vt() & 0x0FFF;
 
         if elem_vt == VT_R8 {
-            // Fast path: 1D array of f64 (Series.Values typical case)
-            return self.as_f64_array();
+            // A raw f64 array cannot express blanks — every element is a value.
+            return Ok(self.as_f64_array()?.into_iter().map(Some).collect());
         }
 
         if elem_vt == VT_VARIANT {
-            // Slow path: array of VARIANTs (Range.Value2 typical case)
-            return self.as_variant_array_flat();
+            unsafe {
+                let psa = self.safearray_ptr()?;
+                let dims = SafeArrayGetDim(psa);
+                return match dims {
+                    1 => self.read_variant_array_1d_opt(psa),
+                    2 => self.read_variant_array_2d_opt(psa),
+                    _ => Err(OaError::Other(format!("Unsupported {dims}D SAFEARRAY"))),
+                };
+            }
         }
 
         Err(OaError::Other(format!("Unsupported SAFEARRAY element type: VT={elem_vt}")))
     }
 
-    /// Extract a SAFEARRAY of VARIANTs (1D or 2D), flattened to Vec<f64>.
-    ///
-    /// Range.Value2 returns 2D (rows × cols). Series.Values may return
-    /// VT_ARRAY|VT_VARIANT in some edge cases. Both are handled.
-    fn as_variant_array_flat(&self) -> OaResult<Vec<f64>> {
-        unsafe {
-            let psa = self.safearray_ptr()?;
-            let dims = SafeArrayGetDim(psa);
-
-            match dims {
-                1 => self.read_variant_array_1d(psa),
-                2 => self.read_variant_array_2d(psa),
-                _ => Err(OaError::Other(format!("Unsupported {dims}D SAFEARRAY"))),
-            }
-        }
-    }
-
-    /// Read 1D SAFEARRAY of VARIANTs.
-    unsafe fn read_variant_array_1d(&self, psa: *const SAFEARRAY) -> OaResult<Vec<f64>> {
+    /// Read 1D SAFEARRAY of VARIANTs, preserving blanks as `None`.
+    unsafe fn read_variant_array_1d_opt(&self, psa: *const SAFEARRAY) -> OaResult<Vec<Option<f64>>> {
         let lb = unsafe { SafeArrayGetLBound(psa, 1).map_err(OaError::Com)? };
         let ub = unsafe { SafeArrayGetUBound(psa, 1).map_err(OaError::Com)? };
         let mut values = Vec::with_capacity((ub - lb + 1) as usize);
 
         for i in lb..=ub {
             let val = unsafe { self.get_variant_element(psa, &[i])? };
-            values.push(variant_to_f64(&val));
+            values.push(variant_to_opt_f64(&val));
         }
         Ok(values)
     }
 
-    /// Read 2D SAFEARRAY of VARIANTs, flattened row-by-row.
-    ///
-    /// Range.Value2 returns (rows, cols) where dim 1 = rows, dim 2 = cols.
-    unsafe fn read_variant_array_2d(&self, psa: *const SAFEARRAY) -> OaResult<Vec<f64>> {
+    /// Read 2D SAFEARRAY of VARIANTs row-by-row, preserving blanks as `None`.
+    unsafe fn read_variant_array_2d_opt(&self, psa: *const SAFEARRAY) -> OaResult<Vec<Option<f64>>> {
         let row_lb = unsafe { SafeArrayGetLBound(psa, 1).map_err(OaError::Com)? };
         let row_ub = unsafe { SafeArrayGetUBound(psa, 1).map_err(OaError::Com)? };
         let col_lb = unsafe { SafeArrayGetLBound(psa, 2).map_err(OaError::Com)? };
@@ -235,7 +229,7 @@ impl Variant {
         for r in row_lb..=row_ub {
             for c in col_lb..=col_ub {
                 let val = unsafe { self.get_variant_element(psa, &[r, c])? };
-                values.push(variant_to_f64(&val));
+                values.push(variant_to_opt_f64(&val));
             }
         }
         Ok(values)
@@ -319,20 +313,48 @@ impl From<VARIANT> for Variant {
     }
 }
 
-/// Convert a raw VARIANT element to f64, treating empty/error as 0.0.
+
+/// Convert a raw VARIANT element to `Option<f64>`, preserving "no value".
 ///
-/// Used when unpacking SAFEARRAY elements from Range.Value2.
-fn variant_to_f64(v: &VARIANT) -> f64 {
-    // Try f64 first (most common for numeric data)
+/// GOTCHA #43: the raw type tag must be inspected FIRST. `f64::try_from(&VARIANT)`
+/// is `VariantToDouble`, which happily coerces VT_EMPTY to `0.0`, so a blank cell
+/// and a real zero are indistinguishable after coercion.
+///
+/// - VT_EMPTY / VT_NULL / VT_ERROR (`#N/A`, `#DIV/0!`) → `None`
+/// - VT_BSTR: `""`/whitespace → `None`; numeric text (optionally `%`) → `Some`; else `None`
+/// - anything else → numeric coercion → `Some`, or `None` if not coercible
+fn variant_to_opt_f64(v: &VARIANT) -> Option<f64> {
+    // SAFETY: reading the discriminant of the VARIANT union.
+    let vt = unsafe { v.Anonymous.Anonymous.vt.0 };
+
+    match vt {
+        VT_EMPTY_TAG | VT_NULL_TAG | VT_ERROR_TAG => return None,
+        VT_BSTR_TAG => {
+            let text = BSTR::try_from(v).map(|b| b.to_string()).unwrap_or_default();
+            return parse_numeric_text(&text);
+        }
+        _ => {}
+    }
+
     if let Ok(val) = f64::try_from(v) {
-        return val;
+        return Some(val);
     }
-    // Try i32 (integer cells)
     if let Ok(val) = i32::try_from(v) {
-        return val as f64;
+        return Some(val as f64);
     }
-    // Empty/null/error/string → 0.0 (matches Python: empty cells plot as zero)
-    0.0
+    None
+}
+
+/// Parse a cell's text as a number for chart data. `"12%"` → `0.12`, `""` → `None`.
+fn parse_numeric_text(text: &str) -> Option<f64> {
+    let s = text.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(pct) = s.strip_suffix('%') {
+        return pct.trim().parse::<f64>().ok().map(|n| n / 100.0);
+    }
+    s.parse::<f64>().ok()
 }
 
 impl Default for Variant {
@@ -478,4 +500,53 @@ mod tests {
         assert!(!Variant::from("hello").is_array());
         assert!(!Variant::empty().is_array());
     }
+
+    // --- as_flat_opt_f64_vec / variant_to_opt_f64 tests (GOTCHA #43) ---
+
+    #[test]
+    fn test_opt_empty_is_none() {
+        assert_eq!(Variant::empty().as_flat_opt_f64_vec().unwrap(), vec![None]);
+    }
+
+    #[test]
+    fn test_opt_zero_is_some_zero() {
+        assert_eq!(Variant::from(0.0f64).as_flat_opt_f64_vec().unwrap(), vec![Some(0.0)]);
+        assert_eq!(Variant::from(0i32).as_flat_opt_f64_vec().unwrap(), vec![Some(0.0)]);
+    }
+
+    #[test]
+    fn test_opt_numeric() {
+        assert_eq!(Variant::from(0.25f64).as_flat_opt_f64_vec().unwrap(), vec![Some(0.25)]);
+        assert_eq!(Variant::from(3i32).as_flat_opt_f64_vec().unwrap(), vec![Some(3.0)]);
+        assert_eq!(Variant::from(-7i32).as_flat_opt_f64_vec().unwrap(), vec![Some(-7.0)]);
+    }
+
+    #[test]
+    fn test_opt_text_blank_is_none() {
+        assert_eq!(Variant::from("").as_flat_opt_f64_vec().unwrap(), vec![None]);
+        assert_eq!(Variant::from("   ").as_flat_opt_f64_vec().unwrap(), vec![None]);
+    }
+
+    #[test]
+    fn test_opt_text_non_numeric_is_none() {
+        assert_eq!(Variant::from("N/A").as_flat_opt_f64_vec().unwrap(), vec![None]);
+        assert_eq!(Variant::from("n/a").as_flat_opt_f64_vec().unwrap(), vec![None]);
+    }
+
+    #[test]
+    fn test_opt_text_numeric_parses() {
+        assert_eq!(Variant::from("2.5").as_flat_opt_f64_vec().unwrap(), vec![Some(2.5)]);
+        assert_eq!(Variant::from("12%").as_flat_opt_f64_vec().unwrap(), vec![Some(0.12)]);
+        assert_eq!(Variant::from(" 0 ").as_flat_opt_f64_vec().unwrap(), vec![Some(0.0)]);
+    }
+
+    #[test]
+    fn test_parse_numeric_text() {
+        assert_eq!(parse_numeric_text(""), None);
+        assert_eq!(parse_numeric_text("abc"), None);
+        assert_eq!(parse_numeric_text("0"), Some(0.0));
+        assert_eq!(parse_numeric_text("-1.5"), Some(-1.5));
+        assert_eq!(parse_numeric_text("50 %"), Some(0.5));
+    }
+
 }

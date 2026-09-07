@@ -20,7 +20,7 @@ use crate::pipeline::delta_updater::determine_sign;
 use crate::pipeline::table_updater::open_or_get_workbook;
 
 /// Series data: Vec of (range_ref, cached_values) per chart.
-type ChartSeriesData = Vec<(String, Vec<f64>)>;
+use crate::zip_ops::chart_data::{ChartSeriesData, ChartValue};
 use crate::shapes::inventory::{build_inventory, SlideInventory};
 use crate::shapes::matcher::TableType;
 use crate::utils::link_parser::parse_source_full_name;
@@ -834,7 +834,7 @@ fn check_charts(
 ///
 /// Returns true if all series match, false if any mismatch found.
 fn check_chart_series_values(
-    ppt_cached: &[(String, Vec<f64>)],  // ZIP-cached values (ref, values) per series
+    ppt_cached: &[(String, Vec<ChartValue>)],  // ZIP-cached values (ref, values) per series; None = no point
     workbooks: &mut Dispatch,
     excel_path: &str,
     series_refs: &[String],
@@ -854,7 +854,7 @@ fn check_chart_series_values(
         name: String,
         diff_count: usize,
         total: usize,
-        pairs: Vec<(f64, f64)>,
+        pairs: Vec<(ChartValue, ChartValue)>,
         has_more: bool,
     }
     let mut mismatches: Vec<SeriesMismatch> = Vec::new();
@@ -917,12 +917,12 @@ fn check_chart_series_values(
 /// Collect first N mismatched (ppt, excel) value pairs for compact display.
 ///
 /// Returns: (total_diff_count, pairs_vec, has_more_beyond_max)
-fn collect_mismatch_pairs(ppt: &[f64], excel: &[f64], max: usize) -> (usize, Vec<(f64, f64)>, bool) {
+fn collect_mismatch_pairs(ppt: &[ChartValue], excel: &[ChartValue], max: usize) -> (usize, Vec<(ChartValue, ChartValue)>, bool) {
     let mut pairs = Vec::new();
     let mut diff_count = 0;
 
     for (p, e) in ppt.iter().zip(excel.iter()) {
-        if !float_eq(*p, *e) {
+        if !value_eq(*p, *e) {
             diff_count += 1;
             if pairs.len() < max {
                 pairs.push((*p, *e));
@@ -942,7 +942,8 @@ fn collect_mismatch_pairs(ppt: &[f64], excel: &[f64], max: usize) -> (usize, Vec
 /// Read Excel values for a chart range reference (supports multi-cell SAFEARRAY).
 ///
 /// Handles non-contiguous ranges like "(Tables!$C$10,Tables!$F$10)" — GOTCHA #20.
-fn read_chart_range(wb: &mut Dispatch, range_ref: &str) -> OaResult<Vec<f64>> {
+/// Blank cells come back as `None` (GOTCHA #43), matching how the update writes them.
+fn read_chart_range(wb: &mut Dispatch, range_ref: &str) -> OaResult<Vec<ChartValue>> {
     let mut values = Vec::new();
 
     // Strip outer parentheses for multi-area ranges
@@ -965,13 +966,8 @@ fn read_chart_range(wb: &mut Dispatch, range_ref: &str) -> OaResult<Vec<f64>> {
             .and_then(|v| v.as_dispatch())
             .and_then(|d| Dispatch::new(d).get("Value2"))?;
 
-        if val.is_array() {
-            values.extend(val.as_flat_f64_vec()?);
-        } else if val.is_empty() {
-            values.push(0.0);
-        } else {
-            values.push(val.as_numeric()?);
-        }
+        // Scalar or SAFEARRAY; blank → None, real 0 → Some(0.0)
+        values.extend(val.as_flat_opt_f64_vec()?);
     }
 
     Ok(values)
@@ -1256,10 +1252,22 @@ fn extract_series_refs(chart_xml: &str) -> Vec<String> {
     refs
 }
 
-/// Compare two value vectors with float tolerance.
-fn values_match(ppt: &[f64], excel: &[f64]) -> bool {
+/// Compare two chart value vectors with float tolerance.
+///
+/// `None` (no point / blank cell) only matches `None`; a blank vs a real 0 is a mismatch
+/// (GOTCHA #43). Length differences always mismatch.
+fn values_match(ppt: &[ChartValue], excel: &[ChartValue]) -> bool {
     if ppt.len() != excel.len() { return false; }
-    ppt.iter().zip(excel.iter()).all(|(a, b)| float_eq(*a, *b))
+    ppt.iter().zip(excel.iter()).all(|(a, b)| value_eq(*a, *b))
+}
+
+/// Option-aware equality: both absent, or both present within tolerance.
+fn value_eq(a: ChartValue, b: ChartValue) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => float_eq(x, y),
+        _ => false,
+    }
 }
 
 fn float_eq(a: f64, b: f64) -> bool {
@@ -1284,9 +1292,19 @@ mod tests {
     #[test]
     fn test_empty_zero() { assert!(float_eq(0.0, 0.0)); }
     #[test]
-    fn test_values_match_ok() { assert!(values_match(&[1.0, 2.0], &[1.0, 2.0])); }
+    fn test_values_match_ok() { assert!(values_match(&[Some(1.0), Some(2.0)], &[Some(1.0), Some(2.0)])); }
     #[test]
-    fn test_values_match_diff_len() { assert!(!values_match(&[1.0], &[1.0, 2.0])); }
+    fn test_values_match_diff_len() { assert!(!values_match(&[Some(1.0)], &[Some(1.0), Some(2.0)])); }
+    #[test]
+    fn test_values_match_blank_vs_blank() { assert!(values_match(&[Some(1.0), None], &[Some(1.0), None])); }
+    #[test]
+    fn test_values_match_blank_vs_zero_is_mismatch() {
+        // GOTCHA #43: absent point ≠ real zero
+        assert!(!values_match(&[None], &[Some(0.0)]));
+        assert!(!values_match(&[Some(0.0)], &[None]));
+    }
+    #[test]
+    fn test_values_match_blank_vs_value_is_mismatch() { assert!(!values_match(&[None], &[Some(0.18)])); }
 
     #[test]
     fn test_ccst_positive() {
@@ -1313,33 +1331,43 @@ mod tests {
 
     #[test]
     fn test_collect_pairs_basic() {
-        let (count, pairs, more) = collect_mismatch_pairs(&[1.0, 2.0, 3.0], &[1.0, 2.5, 3.0], 5);
+        let (count, pairs, more) = collect_mismatch_pairs(
+            &[Some(1.0), Some(2.0), Some(3.0)], &[Some(1.0), Some(2.5), Some(3.0)], 5);
         assert_eq!(count, 1);
         assert_eq!(pairs.len(), 1);
-        assert!((pairs[0].0 - 2.0).abs() < f64::EPSILON);
-        assert!((pairs[0].1 - 2.5).abs() < f64::EPSILON);
+        assert!((pairs[0].0.unwrap() - 2.0).abs() < f64::EPSILON);
+        assert!((pairs[0].1.unwrap() - 2.5).abs() < f64::EPSILON);
         assert!(!more);
     }
 
     #[test]
     fn test_collect_pairs_truncated() {
         let (count, pairs, more) = collect_mismatch_pairs(
-            &[1.0, 2.0, 3.0, 4.0, 5.0],
-            &[0.0, 0.0, 0.0, 0.0, 0.0], 3);
+            &[Some(1.0), Some(2.0), Some(3.0), Some(4.0), Some(5.0)],
+            &[Some(0.0), Some(0.0), Some(0.0), Some(0.0), Some(0.0)], 3);
         assert_eq!(count, 5);
         assert_eq!(pairs.len(), 3);
         assert!(more);
     }
 
     #[test]
+    fn test_collect_pairs_blank_hole() {
+        // Cache has a hole where Excel has a value (the Chart 33 bug) → 1 diff, pair (None, Some)
+        let (count, pairs, _) = collect_mismatch_pairs(
+            &[Some(0.08), Some(0.1), None, Some(0.3)], &[Some(0.08), Some(0.1), Some(0.18), Some(0.3)], 5);
+        assert_eq!(count, 1);
+        assert_eq!(pairs, vec![(None, Some(0.18))]);
+    }
+
+    #[test]
     fn test_collect_pairs_length_mismatch() {
-        let (count, _pairs, _more) = collect_mismatch_pairs(&[1.0], &[1.0, 2.0], 5);
+        let (count, _pairs, _more) = collect_mismatch_pairs(&[Some(1.0)], &[Some(1.0), Some(2.0)], 5);
         assert_eq!(count, 1); // 1 extra element
     }
 
     #[test]
     fn test_collect_pairs_all_match() {
-        let (count, pairs, more) = collect_mismatch_pairs(&[1.0, 2.0], &[1.0, 2.0], 5);
+        let (count, pairs, more) = collect_mismatch_pairs(&[Some(1.0), Some(2.0)], &[Some(1.0), Some(2.0)], 5);
         assert_eq!(count, 0);
         assert!(pairs.is_empty());
         assert!(!more);
@@ -1347,6 +1375,6 @@ mod tests {
 
     #[test]
     fn test_values_match_zero_vs_zero() {
-        assert!(values_match(&[0.0, 0.0], &[0.0, 0.0]));
+        assert!(values_match(&[Some(0.0), Some(0.0)], &[Some(0.0), Some(0.0)]));
     }
 }

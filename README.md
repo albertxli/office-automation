@@ -110,7 +110,7 @@ The update pipeline runs these steps in order:
 | **Tables** | Populate PPT table cells from Excel ranges |
 | **Deltas** | Swap delta indicator arrows based on value sign |
 | **Coloring** | Apply sign-based color coding to _ccst tables |
-| **Charts** | Update chart data links |
+| **Charts** | Rebuild each chart's data cache from Excel and re-point links; blank cells draw nothing, a real 0 draws a zero bar |
 
 Steps can be selectively run or skipped:
 

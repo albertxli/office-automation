@@ -132,16 +132,27 @@ COM collections (Slides, Shapes, Worksheets, etc.) expose their `Item` indexer a
 ### #36 Empty Chart numCache (ptCount But No pt Elements) (Rust-specific)
 Some charts have `<c:numCache>` with `<c:ptCount val="N"/>` but **zero `<c:pt>` data point elements**. The cache structure exists but contains no actual values. This happens when charts are duplicated in the template without their cache being populated, or when the template was created by a tool that didn't fill the cache.
 
-**Impact on oa update:** The ZIP chart data pre-update rewrites existing `<c:pt>/<c:v>` text but can't replace what doesn't exist. **Fix:** Detect the empty-cache case (no `<c:pt>` seen between `<c:numCache>` start and end) and **inject** new `<c:pt idx="N"><c:v>VALUE</c:v></c:pt>` elements from Excel data before writing `</c:numCache>`.
+**Impact on oa update:** The ZIP chart data pre-update cannot "replace" points that do not exist. **Fix (superseded by #43):** every series whose range is in the Excel map is now **rebuilt** — old `<c:pt>` elements are dropped and a fresh one is emitted per non-blank Excel value — so an empty cache is filled the same way as any other.
 
-**Impact on oa check:** Reading cached values from ZIP returns an empty Vec for these series. Comparing `[]` vs `[0.74]` from Excel reports a false mismatch. **Fix:** Skip comparison when cached values are empty (the chart data is unverifiable from the ZIP cache alone).
+**Impact on oa check:** Reading cached values from ZIP returns an empty Vec for these series. Comparing `[]` vs `[0.74]` from Excel reports a false mismatch. **Fix:** Skip comparison when cached values are empty (the chart data is unverifiable from the ZIP cache alone). `extract_cached_values` deliberately returns `[]` (not a Vec of `None`) when a series has no `<c:pt>` so this detection keeps working.
 
 ### #37 Partial Chart numCache (ptCount > Number of pt Elements) (Rust-specific)
 Some charts have `<c:numCache>` with `<c:ptCount val="3"/>` but only 2 `<c:pt>` elements — a partial cache. This happens with multi-series/multi-column charts where the latest wave or year column hasn't been populated yet (e.g., a 3-column chart for 2023/2024/2025 where 2025 data isn't collected yet).
 
-**Impact on oa update:** The ZIP chart data pre-update replaces existing `<c:pt>` values but didn't create the missing trailing ones. **Fix:** Track `max_pt_idx_seen` during cache traversal. On `</c:numCache>`, inject any remaining values from `max_pt_idx_seen` to `vals.len()`. This scales dynamically for any number of columns/series.
+**Impact on oa update:** The old fix tracked `max_pt_idx_seen` and appended only *trailing* points. That missed holes at the start or middle of a series (a blank cell in the template country, e.g. pts 0,1,3 with no 2), which stayed empty forever even when the new country had data. **Fix (superseded by #43):** rebuild the whole series cache from the Excel values; position no longer matters.
 
-**Impact on oa check:** The ZIP cache has fewer values than Excel, causing `1/N differ` mismatches on the missing column. **Fix:** Same injection in oa update ensures the cache is complete.
+**Impact on oa check:** The ZIP cache has fewer values than Excel, causing `1/N differ` mismatches on the missing column. **Fix:** Same rebuild in oa update ensures the cache is complete; check reads holes as `None`.
+
+### #43 Chart Data: Blank Cell ≠ Zero, Rebuild Every Series Cache (Rust-specific)
+PowerPoint stores a blank Excel cell as an **absent** `<c:pt>` (no element at that idx, `ptCount` unchanged) and draws nothing — no bar, no label. A real `0` is a `<c:pt><c:v>0</c:v></c:pt>` and draws a zero bar with a "0%" label. The two must never be confused.
+
+**Reading Excel:** `f64::try_from(&VARIANT)` is `VariantToDouble`, which coerces VT_EMPTY to `0.0` *successfully*, so any "try f64 first" chain turns blanks into zeros. `Variant::as_flat_opt_f64_vec` / `variant_to_opt_f64` inspect the raw type tag FIRST: VT_EMPTY, VT_NULL, VT_ERROR (`#N/A`, `#DIV/0!`) → `None`; VT_BSTR → `None` unless numeric text (`"12%"` → `0.12`); else numeric → `Some`. Chart values are `Option<f64>` (`chart_data::ChartValue`) end to end.
+
+**Writing the cache:** `rewrite_chart_cache` rebuilds each matched series: swallow old `<c:pt>`s (remembering per-point `formatCode` by idx), set `ptCount` to the category count (blanks included), emit `<c:pt>` only for `Some` values in ascending idx, flushed before `<c:extLst>` or at `</c:numCache>`. Series whose range is not in the Excel map pass through untouched. Counts one `series_updated` per rebuilt series.
+
+**Checking:** `oa check` compares `Option` to `Option`: `None`/`None` passes, `None` vs `Some(0.0)` fails. Diff lines print `(blank)`.
+
+**Scope:** only the chart path (`update.rs::zip_chart_preupdate`, `check.rs` chart functions) uses the Option reader. OLE/table/delta/coloring stay on `.Text` (GOTCHA #16) and were not touched.
 
 ### #35 Chart .rels Use Bare Paths (No file:/// Prefix) (Rust-specific)
 OLE link `.rels` in `slides/_rels/` use `file:///C:/path/to/file.xlsx` format. But chart `.rels` in `charts/_rels/` use bare paths: `C:/path/to/file.xlsx` (no `file:///` prefix). The relinker must handle both formats — match and rewrite bare paths as well as `file:///` URIs. Preserve the original format when writing back.

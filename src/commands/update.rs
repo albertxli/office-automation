@@ -377,7 +377,8 @@ fn zip_chart_preupdate(
     );
     let mut wb = open_or_get_workbook(&mut workbooks, &excel_str).map_err(|e| e.to_string())?;
 
-    let mut range_values: std::collections::HashMap<String, Vec<f64>> = std::collections::HashMap::new();
+    // GOTCHA #43: Option<f64> — None = blank cell = no chart point.
+    let mut range_values: std::collections::HashMap<String, Vec<chart_data::ChartValue>> = std::collections::HashMap::new();
 
     for range_ref in &unique_ranges {
         // Parse "Sheet!Range" format
@@ -397,7 +398,7 @@ fn zip_chart_preupdate(
             .and_then(|d| Dispatch::new(d).get("Value2"))
             .map_err(|e| format!("Failed to read range {range_ref}: {e}"))?;
 
-        let values = val.as_flat_f64_vec().map_err(|e| format!("Failed to unpack {range_ref}: {e}"))?;
+        let values = val.as_flat_opt_f64_vec().map_err(|e| format!("Failed to unpack {range_ref}: {e}"))?;
         range_values.insert(range_ref.clone(), values);
     }
 
