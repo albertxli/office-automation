@@ -89,8 +89,16 @@ fn test_info_nonexistent_file() {
         .failure();
 }
 
+/// `oa clean -f` force-kills every PowerPoint/Excel process on the machine, so this
+/// must never run in the default suite. Run with:
+/// `OA_INTEGRATION=1 cargo test --test cli_e2e -- --ignored`
 #[test]
+#[ignore]
 fn test_clean_no_processes() {
+    if std::env::var("OA_INTEGRATION").is_err() {
+        eprintln!("Skipping: OA_INTEGRATION not set");
+        return;
+    }
     oa().args(["clean", "-f"])
         .assert()
         .success()

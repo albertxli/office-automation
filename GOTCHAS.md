@@ -94,6 +94,47 @@ When collecting `numRef` elements from chart XML, only collect those inside `<c:
 ### #24 Unlinked Charts in XML
 Filter `.rels` entries to external references only. Internal chart data (embedded) should not be treated as linked charts.
 
+### #44 Workbook-Qualified Series Formulas `[book.xlsx]Sheet!Range` (Rust-specific)
+A linked chart has **two** places that name the data source, and only one of them is "the link":
+
+1. `ppt/charts/_rels/chartN.xml.rels` → `<Relationship ... Target="file:///C:\...\rpm_2025_Indonesia_v5.xlsx" TargetMode="External"/>`, referenced from the chart XML via `<c:externalData r:id="rId3">`. This is what PowerPoint's Edit Links shows and what the ZIP relinker (#22) rewrites.
+2. Every `<c:f>` inside each `<c:ser>` (tx / cat / val). Normally these are **relative to the linked workbook** and contain only `Sheet!Range`.
+
+**Normal chart** (chart98.xml, Chart 28 on slide 34 of the RPM 2025 template):
+```xml
+<c:tx><c:strRef><c:f>Tables!$K$777</c:f> ...</c:strRef></c:tx>
+<c:val><c:numRef>
+  <c:f>Tables!$K$778:$K$779</c:f>
+  <c:numCache><c:formatCode>0%</c:formatCode><c:ptCount val="2"/>
+    <c:pt idx="0"><c:v>0.11</c:v></c:pt><c:pt idx="1"><c:v>0.3</c:v></c:pt>
+  </c:numCache>
+</c:numRef></c:val>
+```
+
+**Workbook-qualified chart** (chart99.xml, Chart 31 on the same slide — the only such chart in the deck):
+```xml
+<c:cat><c:strRef><c:f>[rpm_2025_Indonesia_v5.xlsx]Tables!$V$777:$Y$777</c:f> ...</c:strRef></c:cat>
+<c:val><c:numRef>
+  <c:f>[rpm_2025_Indonesia_v5.xlsx]Tables!$V$778:$Y$778</c:f>
+  <c:numCache><c:formatCode>0%</c:formatCode><c:ptCount val="4"/>
+    <c:pt idx="0"><c:v>0.12</c:v></c:pt><c:pt idx="1"><c:v>0.27</c:v></c:pt><c:pt idx="3"><c:v>0.05</c:v></c:pt>
+  </c:numCache>
+</c:numRef></c:val>
+```
+The `.rels` link of both charts is byte-identical. The second form means "read `Tables!V778:Y778` from the workbook **named** `rpm_2025_Indonesia_v5.xlsx`", regardless of which file the link points to. Relinking to France changes which workbook gets opened, but Excel then cannot resolve the by-name reference (Indonesia is not open) and every point evaluates to **0**. `LinkFormat.Update()` returns success anyway.
+
+**How it happens:** Excel writes a `[book]` prefix whenever a series range is picked from a workbook *other than the one hosting the chart* — typically the chart was created (or its series were re-selected via Select Data / Edit Data) while the Indonesia workbook was a second open window and the range was clicked there. From the PowerPoint UI the chart looks identical to the others.
+
+**Impact on oa (before fix, v0.3.2):** `zip_chart_preupdate` split at the first `!`, so the sheet name became `[rpm_2025_Indonesia_v5.xlsx]Tables` → `Worksheets.Item` throws `DISP_E_EXCEPTION (0x80020009)`. The `?` on that read aborted the pre-update for **all** charts, everything fell back to the COM path, and the COM `Update()` zeroed Chart 31 while `update_charts` still printed "linked + refreshed". The only trace was a dim `-v` line. `oa check` (`read_chart_range`) had the same split.
+
+**Fix (v0.3.3):**
+- `chart_data::normalize_range_ref` / `strip_workbook_prefix` drop the `[book]` qualifier from each sub-range, so the Excel read and the numCache lookup both use `Tables!V778:Y778`.
+- `rewrite_chart_cache` rewrites **every** `<c:f>` (tx, cat, val) without the qualifier — the chart becomes structurally identical to a normally built one and refreshes from whatever workbook it is linked to. No opt-out: a stale chart is never preferable; rebuild it from Excel by hand if you want a clean start.
+- Each affected chart is reported with `verbose::warn` (always printed, yellow `⚠`, stderr) as `Slide 34 │ Chart 31 · 4 formulas named [rpm_2025_Indonesia_v5.xlsx] → removed …`, using `slide_map::chart_part_owners` to map the chart part to slide + shape. The completion line appends `· N warning(s)`.
+- One unreadable range no longer aborts the pre-update; it is warned about and `all_ranges_ok=false` keeps the COM `Update()` fallback for that run.
+- `chart_updater` no longer counts a failed `Update()` as updated (`refresh FAILED` + warning).
+- `oa check` normalises refs before reading Excel and flags any chart whose formulas still name a workbook (`formula names [book.xlsx]`).
+
 ## Miscellaneous
 
 ### #8 VBA Reference

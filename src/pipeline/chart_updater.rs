@@ -55,15 +55,27 @@ pub fn update_charts(
         } else {
             // Full COM update: set source + refresh data
             if let Err(e) = link_format.put("SourceFullName", Variant::from(excel_path)) {
-                eprintln!("Warning: failed to set chart SourceFullName for '{}': {e}", chart_ref.name);
+                super::verbose::warn(&format!(
+                    "Slide {:>2} │ {} · failed to set chart source: {e}",
+                    chart_ref.slide_index, chart_ref.name));
                 continue;
             }
-            if let Err(e) = link_format.call0("Update") {
-                eprintln!("Warning: failed to update chart data for '{}': {e}", chart_ref.name);
-            }
+            let refreshed = match link_format.call0("Update") {
+                Ok(_) => true,
+                Err(e) => {
+                    super::verbose::warn(&format!(
+                        "Slide {:>2} │ {} · chart refresh failed: {e}",
+                        chart_ref.slide_index, chart_ref.name));
+                    false
+                }
+            };
             let _ = link_format.put("AutoUpdate", Variant::from(PpUpdateOption::Manual as i32));
-            updated += 1;
-            super::verbose::detail(chart_ref.slide_index, &chart_ref.name, "linked + refreshed");
+            if refreshed {
+                updated += 1;
+                super::verbose::detail(chart_ref.slide_index, &chart_ref.name, "linked + refreshed");
+            } else {
+                super::verbose::detail(chart_ref.slide_index, &chart_ref.name, "refresh FAILED");
+            }
         }
     }
 

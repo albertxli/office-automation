@@ -3,12 +3,35 @@
 //! Prints dim, indented detail lines when verbose mode is active.
 //! Zero cost when verbose=false (just a bool check).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use console::Style;
 
 /// Global verbose flag — set once at pipeline start.
 static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// Warnings emitted for the current file (reset per file, shown on the completion line).
+static WARNINGS: AtomicUsize = AtomicUsize::new(0);
+
+/// Print a warning that is ALWAYS shown (verbose or not, quiet or not) and count it.
+///
+/// Goes to stderr in yellow: `  ⚠ {msg}`. Use for anything the user must not miss,
+/// e.g. a chart whose formulas had to be rewritten (GOTCHA #44) or a failed refresh.
+pub fn warn(msg: &str) {
+    WARNINGS.fetch_add(1, Ordering::Relaxed);
+    let s = Style::new().yellow();
+    eprintln!("  {} {}", s.apply_to("⚠"), s.apply_to(msg));
+}
+
+/// Number of warnings since the last `reset_warnings()`.
+pub fn warning_count() -> usize {
+    WARNINGS.load(Ordering::Relaxed)
+}
+
+/// Reset the warning counter (call at the start of each file).
+pub fn reset_warnings() {
+    WARNINGS.store(0, Ordering::Relaxed);
+}
 
 /// Enable verbose output.
 pub fn set_verbose(on: bool) {

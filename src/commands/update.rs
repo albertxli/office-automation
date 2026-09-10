@@ -147,6 +147,7 @@ fn process_single_file(
 
     use crate::pipeline::verbose as pverbose;
     pverbose::set_verbose(verbose);
+    pverbose::reset_warnings();
 
     // ZIP pre-relink (before Open, so PowerPoint reads corrected paths)
     if !dry_run {
@@ -181,19 +182,26 @@ fn process_single_file(
         let chart_t = std::time::Instant::now();
         match zip_chart_preupdate(pptx_path, excel_path, &mut session.excel_app, quiet, verbose) {
             Ok(result) => {
-                chart_data_ok = result.charts_updated > 0 || result.series_updated == 0;
+                // A range we could not read leaves that chart's cache stale; keep the
+                // COM Update() fallback for all charts in that case (slow but correct).
+                chart_data_ok = result.all_ranges_ok
+                    && (result.charts_updated > 0 || result.series_updated == 0);
                 let chart_elapsed = chart_t.elapsed().as_secs_f64();
                 if verbose {
+                    let fixed = if result.fixed.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {} fixed", result.fixed.len())
+                    };
                     pverbose::note(&format!(
-                        "Chart pre-update ··········· {} charts ({} series) · {:.1}s",
+                        "Chart pre-update ··········· {} charts ({} series{fixed}) · {:.1}s",
                         result.charts_updated, result.series_updated, chart_elapsed
                     ));
                 }
             }
             Err(e) => {
-                if verbose {
-                    pverbose::note(&format!("Chart pre-update skipped: {e}"));
-                }
+                // Shown without -v: every chart now goes through the slow COM path.
+                pverbose::warn(&format!("Chart pre-update skipped, falling back to COM refresh: {e}"));
             }
         }
     }
@@ -348,6 +356,10 @@ fn pick_excel_file() -> OaResult<PathBuf> {
 ///
 /// Opens the Excel workbook (via already-open Excel app), reads all chart range values
 /// in batch using Range.Value2 (SAFEARRAY), then rewrites the PPTX chart XML cache.
+///
+/// A range that cannot be read is reported with `verbose::warn` and skipped — it never
+/// aborts the pre-update for the other charts (GOTCHA #44). Charts whose `<c:f>` named a
+/// workbook explicitly are normalised and reported the same way.
 fn zip_chart_preupdate(
     pptx_path: &Path,
     excel_path: &Path,
@@ -361,14 +373,18 @@ fn zip_chart_preupdate(
     // Step 1: Scan chart XML for range references
     let chart_ranges = chart_data::scan_chart_ranges(pptx_path)?;
     if chart_ranges.is_empty() {
-        return Ok(chart_data::ChartDataResult { charts_updated: 0, series_updated: 0 });
+        return Ok(chart_data::ChartDataResult { all_ranges_ok: true, ..Default::default() });
     }
 
-    // Step 2: Collect unique range refs and read values from Excel via COM
+    // Step 2: Collect unique range refs (normalised: no `$`, no `[workbook]`) and read
+    // values from Excel via COM
     let unique_ranges = chart_data::collect_unique_ranges(&chart_ranges);
     if unique_ranges.is_empty() {
-        return Ok(chart_data::ChartDataResult { charts_updated: 0, series_updated: 0 });
+        return Ok(chart_data::ChartDataResult { all_ranges_ok: true, ..Default::default() });
     }
+    let excel_name = excel_path.file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
 
     let excel_str = strip_unc(&excel_path.canonicalize().map_err(|e| e.to_string())?);
     let mut workbooks = Dispatch::new(
@@ -379,6 +395,7 @@ fn zip_chart_preupdate(
 
     // GOTCHA #43: Option<f64> — None = blank cell = no chart point.
     let mut range_values: std::collections::HashMap<String, Vec<chart_data::ChartValue>> = std::collections::HashMap::new();
+    let mut all_ranges_ok = true;
 
     for range_ref in &unique_ranges {
         // Parse "Sheet!Range" format
@@ -389,21 +406,47 @@ fn zip_chart_preupdate(
         };
 
         // Read via Range.Value2 (SAFEARRAY batch — one COM call per range)
-        let val = wb.get("Worksheets")
+        let read = wb.get("Worksheets")
             .and_then(|v| v.as_dispatch())
             .and_then(|d| Dispatch::new(d).call("Item", &[Variant::from(sheet_name.as_str())]))
             .and_then(|v| v.as_dispatch())
             .and_then(|d| Dispatch::new(d).call("Range", &[Variant::from(range_addr.as_str())]))
             .and_then(|v| v.as_dispatch())
             .and_then(|d| Dispatch::new(d).get("Value2"))
-            .map_err(|e| format!("Failed to read range {range_ref}: {e}"))?;
+            .and_then(|val| val.as_flat_opt_f64_vec());
 
-        let values = val.as_flat_opt_f64_vec().map_err(|e| format!("Failed to unpack {range_ref}: {e}"))?;
-        range_values.insert(range_ref.clone(), values);
+        match read {
+            Ok(values) => { range_values.insert(range_ref.clone(), values); }
+            Err(e) => {
+                // One bad range must not abort the other charts (GOTCHA #44).
+                all_ranges_ok = false;
+                crate::pipeline::verbose::warn(&format!(
+                    "chart range {range_ref} unreadable in {excel_name}: {e} — affected charts refreshed via COM instead"
+                ));
+            }
+        }
     }
 
-    // Step 3: Rewrite chart XML cache in the PPTX ZIP
-    chart_data::update_chart_data(pptx_path, &range_values)
+    // Step 3: Rewrite chart XML cache (and normalise formulas) in the PPTX ZIP
+    let mut result = chart_data::update_chart_data(pptx_path, &range_values)?;
+    result.all_ranges_ok = all_ranges_ok;
+
+    // Report charts whose formulas named a workbook explicitly (GOTCHA #44)
+    if !result.fixed.is_empty() {
+        let owners = crate::zip_ops::slide_map::chart_part_owners(pptx_path).unwrap_or_default();
+        for fx in &result.fixed {
+            let who = match owners.get(&fx.part) {
+                Some((slide, name)) => format!("Slide {slide:>2} │ {name}"),
+                None => fx.part.clone(),
+            };
+            crate::pipeline::verbose::warn(&format!(
+                "{who} · {} formulas named [{}] → removed, chart now reads from the linked workbook",
+                fx.formulas, fx.book
+            ));
+        }
+    }
+
+    Ok(result)
 }
 
 /// Build a comfy-table with our standard style.
@@ -427,10 +470,19 @@ fn print_completion(results: &PipelineResults, total_secs: f64, dry_run: bool) {
         }
     }
 
+    // Warnings were already printed (always, via verbose::warn); repeat the count here
+    // so it is visible even when the warning lines scrolled away.
+    let s_warn = Style::new().yellow();
+    let warnings = crate::pipeline::verbose::warning_count();
+    let warn_suffix = match warnings {
+        0 => String::new(),
+        1 => format!(" {} {}", s_dim.apply_to("·"), s_warn.apply_to("1 warning")),
+        n => format!(" {} {}", s_dim.apply_to("·"), s_warn.apply_to(format!("{n} warnings"))),
+    };
+
     println!();
     if dry_run {
-        let s_warn = Style::new().yellow();
-        println!("  {} {} {} {} {} {}",
+        println!("  {} {} {} {} {} {}{warn_suffix}",
             s_warn.apply_to("⚠ dry run"),
             s_dim.apply_to("·"),
             s_count.apply_to(results.total_objects()),
@@ -438,7 +490,7 @@ fn print_completion(results: &PipelineResults, total_secs: f64, dry_run: bool) {
             s_dim.apply_to("·"),
             s_warn.apply_to("not saved"));
     } else {
-        println!("  {} {} {} {} {}",
+        println!("  {} {} {} {} {}{warn_suffix}",
             s_ok.apply_to("✓ completed"),
             s_dim.apply_to("·"),
             s_count.apply_to(results.total_objects()),

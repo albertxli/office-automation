@@ -4,7 +4,6 @@
 //! Returns exit code 0 if all match, 1 if mismatches found.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::time::Instant;
 
 use console::Style;
@@ -21,6 +20,7 @@ use crate::pipeline::table_updater::open_or_get_workbook;
 
 /// Series data: Vec of (range_ref, cached_values) per chart.
 use crate::zip_ops::chart_data::{ChartSeriesData, ChartValue};
+use crate::zip_ops::slide_map::{get_slide_order, read_rels_map, read_zip_entry};
 use crate::shapes::inventory::{build_inventory, SlideInventory};
 use crate::shapes::matcher::TableType;
 use crate::utils::link_parser::parse_source_full_name;
@@ -789,6 +789,25 @@ fn check_charts(
                     &format!("{} {}", s_red.apply_to("wrong link:"), s_dim.apply_to(short)));
             }
 
+            // Check 1b: formulas must not name a workbook (GOTCHA #44) — such a chart
+            // zeroes on the next refresh because Excel resolves the name, not the link.
+            if let Some(book) = refs.and_then(|r| r.iter()
+                .find_map(|f| crate::zip_ops::chart_data::strip_workbook_prefix(f).0))
+            {
+                result.chart_mismatches.push(Mismatch {
+                    slide: chart_ref.slide_index,
+                    shape: chart_ref.name.clone(),
+                    category: "chart".into(),
+                    detail: format!("formula names [{book}]"),
+                });
+                chart_ok = false;
+                let s_red = console::Style::new().red();
+                let s_dim = console::Style::new().dim();
+                crate::pipeline::verbose::check_detail(
+                    chart_ref.slide_index, "chart", &chart_ref.name, false,
+                    &format!("{} {}", s_red.apply_to("formula names"), s_dim.apply_to(format!("[{book}]"))));
+            }
+
             // Check 2: series count matches
             if expected_series > 0 && series_count != expected_series {
                 result.chart_mismatches.push(Mismatch {
@@ -946,12 +965,12 @@ fn collect_mismatch_pairs(ppt: &[ChartValue], excel: &[ChartValue], max: usize) 
 fn read_chart_range(wb: &mut Dispatch, range_ref: &str) -> OaResult<Vec<ChartValue>> {
     let mut values = Vec::new();
 
-    // Strip outer parentheses for multi-area ranges
-    let ref_str = range_ref.trim_start_matches('(').trim_end_matches(')');
+    // Strip outer parentheses, `$`, and any `[workbook]` qualifier (GOTCHA #44)
+    let ref_str = crate::zip_ops::chart_data::normalize_range_ref(range_ref);
 
     // Split on comma for non-contiguous ranges (GOTCHA #20)
     for sub_range in ref_str.split(',') {
-        let sub = sub_range.trim().replace('$', "");
+        let sub = sub_range.trim().to_string();
         let (sheet_name, range_addr) = if let Some(pos) = sub.find('!') {
             (sub[..pos].to_string(), sub[pos + 1..].to_string())
         } else {
@@ -1070,93 +1089,6 @@ fn build_chart_cache_map(pptx_path: &std::path::Path) -> Result<HashMap<(i32, us
     }
 
     Ok(result)
-}
-
-/// Get ordered slide list from presentation.xml.
-fn get_slide_order(archive: &mut zip::ZipArchive<std::fs::File>) -> Result<Vec<String>, String> {
-    let pres_xml = read_zip_entry(archive, "ppt/presentation.xml")
-        .ok_or("Missing presentation.xml")?;
-    let pres_rels = read_zip_entry(archive, "ppt/_rels/presentation.xml.rels")
-        .ok_or("Missing presentation.xml.rels")?;
-
-    // Parse rels to build rId → target map
-    let mut rid_map: HashMap<String, String> = HashMap::new();
-    let mut reader = quick_xml::Reader::from_reader(pres_rels.as_bytes());
-    let mut buf = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(quick_xml::events::Event::Empty(ref e)) | Ok(quick_xml::events::Event::Start(ref e)) => {
-                if e.local_name().as_ref() == b"Relationship" {
-                    let id = e.try_get_attribute("Id").ok().flatten().map(|a| String::from_utf8_lossy(a.value.as_ref()).to_string());
-                    let target = e.try_get_attribute("Target").ok().flatten().map(|a| String::from_utf8_lossy(a.value.as_ref()).to_string());
-                    if let (Some(id), Some(target)) = (id, target) {
-                        rid_map.insert(id, target);
-                    }
-                }
-            }
-            Ok(quick_xml::events::Event::Eof) => break,
-            Err(_) => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    // Parse presentation.xml for sldIdLst
-    let mut slides = Vec::new();
-    let mut reader = quick_xml::Reader::from_reader(pres_xml.as_bytes());
-    buf.clear();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(quick_xml::events::Event::Empty(ref e)) | Ok(quick_xml::events::Event::Start(ref e)) => {
-                if e.local_name().as_ref() == b"sldId"
-                    && let Some(rid) = e.try_get_attribute(b"r:id").ok().flatten()
-                        .map(|a| String::from_utf8_lossy(a.value.as_ref()).to_string())
-                        && let Some(target) = rid_map.get(&rid) {
-                            slides.push(format!("ppt/{target}"));
-                        }
-            }
-            Ok(quick_xml::events::Event::Eof) => break,
-            Err(_) => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    Ok(slides)
-}
-
-/// Read a ZIP entry as string.
-fn read_zip_entry(archive: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Option<String> {
-    let mut entry = archive.by_name(name).ok()?;
-    let mut data = String::new();
-    entry.read_to_string(&mut data).ok()?;
-    Some(data)
-}
-
-/// Read .rels file and return rId → Target map.
-fn read_rels_map(archive: &mut zip::ZipArchive<std::fs::File>, path: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    let xml = match read_zip_entry(archive, path) { Some(d) => d, None => return map };
-    let mut reader = quick_xml::Reader::from_reader(xml.as_bytes());
-    let mut buf = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(quick_xml::events::Event::Empty(ref e)) | Ok(quick_xml::events::Event::Start(ref e)) => {
-                if e.local_name().as_ref() == b"Relationship" {
-                    let id = e.try_get_attribute("Id").ok().flatten().map(|a| String::from_utf8_lossy(a.value.as_ref()).to_string());
-                    let target = e.try_get_attribute("Target").ok().flatten().map(|a| String::from_utf8_lossy(a.value.as_ref()).to_string());
-                    if let (Some(id), Some(target)) = (id, target) {
-                        map.insert(id, target);
-                    }
-                }
-            }
-            Ok(quick_xml::events::Event::Eof) => break,
-            Err(_) => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-    map
 }
 
 /// Check if a chart's .rels has an external link.

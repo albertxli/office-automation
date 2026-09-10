@@ -21,10 +21,36 @@ pub type ChartValue = Option<f64>;
 /// Series data: Vec of (range_ref, cached_values) per chart.
 pub type ChartSeriesData = Vec<(String, Vec<ChartValue>)>;
 
+/// A chart whose `<c:f>` formulas carried a `[workbook]` qualifier that was removed (GOTCHA #44).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FixedChart {
+    /// ZIP part name, e.g. `ppt/charts/chart99.xml`.
+    pub part: String,
+    /// The workbook name that was stripped, e.g. `rpm_2025_Indonesia_v5.xlsx`.
+    pub book: String,
+    /// Number of `<c:f>` elements rewritten in this chart.
+    pub formulas: usize,
+}
+
 /// Result of chart data pre-update.
+#[derive(Debug, Default)]
 pub struct ChartDataResult {
     pub charts_updated: usize,
     pub series_updated: usize,
+    /// Charts whose formulas were normalised (GOTCHA #44) — reported as warnings.
+    pub fixed: Vec<FixedChart>,
+    /// False when at least one range could not be read from Excel; the caller then
+    /// keeps the COM `Update()` fallback for all charts.
+    pub all_ranges_ok: bool,
+}
+
+/// Per-chart statistics from `rewrite_chart_cache`.
+#[derive(Debug, Default, PartialEq)]
+pub struct RewriteStats {
+    pub series_updated: usize,
+    pub formulas_fixed: usize,
+    /// Workbook name stripped from `<c:f>` (first one seen), if any.
+    pub book: Option<String>,
 }
 
 /// Scan all chart XML files in a PPTX and collect unique range references.
@@ -95,6 +121,7 @@ pub fn update_chart_data(
 
     let mut charts_updated = 0usize;
     let mut series_updated = 0usize;
+    let mut fixed: Vec<FixedChart> = Vec::new();
 
     // Pre-collect chart names, then check external links in a separate pass
     let all_chart_names: Vec<String> = (0..reader.len())
@@ -129,12 +156,19 @@ pub fn update_chart_data(
             entry.read_to_end(&mut xml_data).map_err(|e| format!("Failed to read {name}: {e}"))?;
 
             match rewrite_chart_cache(&xml_data, range_values) {
-                Ok((modified_xml, count)) => {
+                Ok((modified_xml, stats)) => {
                     writer.start_file(&name, options).map_err(|e| format!("ZIP write error: {e}"))?;
                     writer.write_all(&modified_xml).map_err(|e| format!("ZIP write error: {e}"))?;
-                    if count > 0 {
+                    if stats.series_updated > 0 {
                         charts_updated += 1;
-                        series_updated += count;
+                        series_updated += stats.series_updated;
+                    }
+                    if stats.formulas_fixed > 0 {
+                        fixed.push(FixedChart {
+                            part: name.clone(),
+                            book: stats.book.unwrap_or_default(),
+                            formulas: stats.formulas_fixed,
+                        });
                     }
                 }
                 Err(_) => {
@@ -155,7 +189,7 @@ pub fn update_chart_data(
         format!("Failed to replace PPTX: {e}")
     })?;
 
-    Ok(ChartDataResult { charts_updated, series_updated })
+    Ok(ChartDataResult { charts_updated, series_updated, fixed, all_ranges_ok: true })
 }
 
 /// Write `<c:pt idx="i"><c:v>val</c:v></c:pt>` for every `Some` value, ascending idx.
@@ -194,12 +228,15 @@ fn write_points(
 /// stale points (GOTCHA #43, superseding the trailing-only logic of #36/#37).
 /// Series whose range is not in the map pass through byte-for-byte.
 ///
-/// Returns (modified_xml, number_of_series_rebuilt).
+/// GOTCHA #44: every `<c:f>` (tx, cat, val) that carries a `[workbook]` qualifier is
+/// rewritten without it, so the chart resolves against whatever workbook it is linked to.
+///
+/// Returns (modified_xml, stats).
 fn rewrite_chart_cache(
     xml: &[u8],
     range_values: &HashMap<String, Vec<ChartValue>>,
-) -> Result<(Vec<u8>, usize), String> {
-    use quick_xml::events::Event;
+) -> Result<(Vec<u8>, RewriteStats), String> {
+    use quick_xml::events::{BytesText, Event};
     use quick_xml::reader::Reader;
     use quick_xml::writer::Writer;
 
@@ -211,13 +248,14 @@ fn rewrite_chart_cache(
     let mut in_val = false;      // inside <c:val> (NOT <c:cat> — GOTCHA #23)
     let mut in_num_ref = false;
     let mut in_num_cache = false;
-    let mut in_f = false;        // inside <c:f> (formula/range ref)
+    let mut in_f = false;        // inside <c:ser>/<c:val>/<c:numRef>/<c:f> (range we rebuild)
+    let mut in_any_f = false;    // inside ANY <c:f> (tx/cat/val — prefix stripping, GOTCHA #44)
     let mut in_pt = false;       // inside <c:pt>
 
     let mut current_range_ref = String::new();
     let mut current_values: Option<&Vec<ChartValue>> = None;
     let mut combined_values_buf: Option<Vec<ChartValue>> = None; // Buffer for non-contiguous ranges
-    let mut series_updated = 0usize;
+    let mut stats = RewriteStats::default();
 
     // Rebuild state for the numCache currently being rewritten
     let mut rebuild = false;          // true while inside a numCache we own
@@ -234,7 +272,10 @@ fn rewrite_chart_cache(
                     b"ser" => { in_ser = true; }
                     b"val" if in_ser => { in_val = true; }
                     b"numRef" if in_val => { in_num_ref = true; }
-                    b"f" if in_num_ref => { in_f = true; }
+                    b"f" => {
+                        in_any_f = true;
+                        if in_num_ref { in_f = true; }
+                    }
                     b"numCache" if in_num_ref => {
                         in_num_cache = true;
                         flushed = false;
@@ -312,12 +353,12 @@ fn rewrite_chart_cache(
                                     write_points(&mut writer, vals, &pt_format_codes)?;
                                 }
                             flushed = true;
-                            series_updated += 1;
+                            stats.series_updated += 1;
                         }
                         rebuild = false;
                         in_num_cache = false;
                     }
-                    b"f" => { in_f = false; }
+                    b"f" => { in_f = false; in_any_f = false; }
                     b"pt" => {
                         skip_write = rebuild && in_pt;
                         in_pt = false;
@@ -351,10 +392,21 @@ fn rewrite_chart_cache(
             }
 
             Ok(Event::Text(ref t)) => {
-                if in_f && in_num_ref && in_val {
-                    // Capture the range reference
-                    current_range_ref = String::from_utf8_lossy(t.as_ref()).to_string();
-                    writer.write_event(Event::Text(t.clone())).map_err(|e| e.to_string())?;
+                if in_any_f {
+                    // GOTCHA #44: drop any `[workbook]` qualifier from the formula text.
+                    let raw = String::from_utf8_lossy(t.as_ref()).to_string();
+                    let (book, cleaned) = strip_formula_prefixes(&raw);
+                    if in_f && in_num_ref && in_val {
+                        // Capture the (cleaned) value range reference for the cache rebuild
+                        current_range_ref = cleaned.clone();
+                    }
+                    if let Some(book) = book {
+                        stats.formulas_fixed += 1;
+                        stats.book.get_or_insert(book);
+                        writer.write_event(Event::Text(BytesText::new(&cleaned))).map_err(|e| e.to_string())?;
+                    } else {
+                        writer.write_event(Event::Text(t.clone())).map_err(|e| e.to_string())?;
+                    }
                 } else if rebuild && in_pt {
                     // Old point value — swallowed, rebuilt from Excel
                     continue;
@@ -371,7 +423,7 @@ fn rewrite_chart_cache(
         }
     }
 
-    Ok((writer.into_inner(), series_updated))
+    Ok((writer.into_inner(), stats))
 }
 
 /// Extract value-axis range references from chart XML.
@@ -422,14 +474,65 @@ fn extract_val_refs(xml: &str) -> Vec<String> {
     refs
 }
 
-/// Normalize a range reference for HashMap lookup.
-/// Strips `$` signs and outer parentheses.
-fn normalize_range_ref(range_ref: &str) -> String {
-    range_ref
+/// Normalize a range reference for HashMap lookup and for reading from Excel.
+/// Strips `$` signs, outer parentheses, and any `[workbook]` qualifier (GOTCHA #44)
+/// from each comma-separated sub-range.
+pub fn normalize_range_ref(range_ref: &str) -> String {
+    let base = range_ref
         .trim()
         .trim_start_matches('(')
         .trim_end_matches(')')
-        .replace('$', "")
+        .replace('$', "");
+    if !base.contains('[') {
+        return base;
+    }
+    base.split(',')
+        .map(|sub| strip_workbook_prefix(sub.trim()).1)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Strip a `[workbook]` qualifier from the sheet part of ONE range ref (GOTCHA #44).
+///
+/// `[b.xlsx]Tables!$A$1` → `Tables!$A$1`; `'[b.xlsx]My Sheet'!$A$1` → `'My Sheet'!$A$1`.
+/// Returns the removed workbook name and the cleaned ref. Refs without `!` or without a
+/// bracket pair before the `!` are returned unchanged.
+pub fn strip_workbook_prefix(range_ref: &str) -> (Option<String>, String) {
+    let Some(bang) = range_ref.find('!') else {
+        return (None, range_ref.to_string());
+    };
+    let sheet_part = &range_ref[..bang];
+    let (Some(open), Some(close)) = (sheet_part.find('['), sheet_part.find(']')) else {
+        return (None, range_ref.to_string());
+    };
+    if close < open {
+        return (None, range_ref.to_string());
+    }
+    let book = sheet_part[open + 1..close].to_string();
+    let cleaned = format!("{}{}{}", &sheet_part[..open], &sheet_part[close + 1..], &range_ref[bang..]);
+    (Some(book), cleaned)
+}
+
+/// Strip `[workbook]` qualifiers from a raw `<c:f>` formula, preserving `$` signs and
+/// the parentheses of a multi-area formula (GOTCHA #20). Returns the first workbook name
+/// removed (if any) and the cleaned formula.
+fn strip_formula_prefixes(formula: &str) -> (Option<String>, String) {
+    if !formula.contains('[') {
+        return (None, formula.to_string());
+    }
+    let mut book: Option<String> = None;
+    let cleaned = formula
+        .split(',')
+        .map(|sub| {
+            let (b, s) = strip_workbook_prefix(sub);
+            if let Some(b) = b {
+                book.get_or_insert(b);
+            }
+            s
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    (book, cleaned)
 }
 
 /// Check if a chart's .rels has an external link.
@@ -685,9 +788,9 @@ mod tests {
         let mut values = HashMap::new();
         values.insert("Tables!B1:B3".to_string(), vec![Some(0.5), Some(0.6), Some(0.7)]);
 
-        let (output, count) = rewrite_chart_cache(xml, &values).unwrap();
+        let (output, st) = rewrite_chart_cache(xml, &values).unwrap();
         let output_str = String::from_utf8(output).unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(st.series_updated, 1);
         assert!(output_str.contains("0.5"));
         assert!(output_str.contains("0.6"));
         assert!(output_str.contains("0.7"));
@@ -752,9 +855,9 @@ mod tests {
         let xml = chart_with_cache(r#"<c:formatCode>0%</c:formatCode><c:ptCount val="4"/>
 <c:pt idx="0"><c:v>0.05</c:v></c:pt><c:pt idx="1"><c:v>0.02</c:v></c:pt><c:pt idx="3"><c:v>0.13</c:v></c:pt>"#);
         let m = vals("Tables!B1:B4", vec![Some(0.08), Some(0.1), Some(0.18), Some(0.3)]);
-        let (out, count) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
+        let (out, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(st.series_updated, 1);
         assert_eq!(pt_count_of(&s), 4);
         assert_eq!(pts_of(&s), vec![
             (0, "0.08".into()), (1, "0.1".into()), (2, "0.18".into()), (3, "0.3".into()),
@@ -769,9 +872,9 @@ mod tests {
         let xml = chart_with_cache(r#"<c:ptCount val="3"/>
 <c:pt idx="1"><c:v>0.07</c:v></c:pt><c:pt idx="2"><c:v>0.12</c:v></c:pt>"#);
         let m = vals("Tables!B1:B4", vec![Some(0.25), Some(0.45), Some(0.22)]);
-        let (out, count) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
+        let (out, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(st.series_updated, 1);
         assert_eq!(pt_count_of(&s), 3);
         assert_eq!(pts_of(&s), vec![(0, "0.25".into()), (1, "0.45".into()), (2, "0.22".into())]);
     }
@@ -790,9 +893,9 @@ mod tests {
     fn test_rewrite_fills_empty_cache_gotcha_36() {
         let xml = chart_with_cache(r#"<c:ptCount val="3"/>"#);
         let m = vals("Tables!B1:B4", vec![Some(0.4), Some(0.5), Some(0.6)]);
-        let (out, count) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
+        let (out, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(st.series_updated, 1);
         assert_eq!(pts_of(&s), vec![(0, "0.4".into()), (1, "0.5".into()), (2, "0.6".into())]);
     }
 
@@ -805,9 +908,9 @@ mod tests {
 <c:pt idx="0"><c:v>0.08</c:v></c:pt><c:pt idx="1"><c:v>0.1</c:v></c:pt>
 <c:pt idx="2"><c:v>0.18</c:v></c:pt><c:pt idx="3"><c:v>0.3</c:v></c:pt>"#);
         let m = vals("Tables!B1:B4", vec![Some(0.05), Some(0.02), None, Some(0.13)]);
-        let (out, count) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
+        let (out, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(st.series_updated, 1);
         assert_eq!(pt_count_of(&s), 4, "ptCount stays the category count");
         assert_eq!(pts_of(&s), vec![(0, "0.05".into()), (1, "0.02".into()), (3, "0.13".into())]);
         assert!(!s.contains("<c:v>0</c:v>"), "a blank must not become a zero point");
@@ -838,9 +941,9 @@ mod tests {
         let xml = chart_with_cache(r#"<c:ptCount val="2"/>
 <c:pt idx="0"><c:v>0.1</c:v></c:pt><c:pt idx="1"><c:v>0.2</c:v></c:pt>"#);
         let m = vals("Tables!B1:B4", vec![None, None]);
-        let (out, count) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
+        let (out, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(st.series_updated, 1);
         assert_eq!(pt_count_of(&s), 2);
         assert!(pts_of(&s).is_empty());
     }
@@ -877,8 +980,8 @@ mod tests {
         let xml = chart_with_cache(r#"<c:ptCount val="4"/>
 <c:pt idx="0"><c:v>0.05</c:v></c:pt><c:pt idx="3"><c:v>0.13</c:v></c:pt>"#);
         let m = vals("Tables!Z1:Z4", vec![Some(1.0)]);
-        let (out, count) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
-        assert_eq!(count, 0);
+        let (out, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
+        assert_eq!(st.series_updated, 0);
         assert_eq!(String::from_utf8(out).unwrap(), xml);
     }
 
@@ -894,9 +997,9 @@ mod tests {
         let mut m = HashMap::new();
         m.insert("Tables!C10".to_string(), vec![Some(0.7)]);
         m.insert("Tables!F10".to_string(), vec![None]);
-        let (out, count) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
+        let (out, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(st.series_updated, 1);
         assert_eq!(pt_count_of(&s), 2);
         assert_eq!(pts_of(&s), vec![(0, "0.7".into())]);
     }
@@ -914,8 +1017,8 @@ mod tests {
         m.insert("Tables!B1:B2".to_string(), vec![Some(1.0), Some(2.0)]);
         m.insert("Tables!C1:C2".to_string(), vec![Some(3.0), None]);
         // D not in map → untouched
-        let (_, count) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
-        assert_eq!(count, 2);
+        let (_, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
+        assert_eq!(st.series_updated, 2);
     }
 
     // ── extract_cached_values ──────────────────────────────
@@ -968,6 +1071,96 @@ mod tests {
         let got = extract_cached_values(&xml);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].1, vec![Some(0.5)]);
+    }
+
+    // ── GOTCHA #44: [workbook] qualified formulas ──────────
+
+    #[test]
+    fn test_strip_workbook_prefix() {
+        assert_eq!(
+            strip_workbook_prefix("[rpm_2025_Indonesia_v5.xlsx]Tables!$V$778:$Y$778"),
+            (Some("rpm_2025_Indonesia_v5.xlsx".into()), "Tables!$V$778:$Y$778".into())
+        );
+        assert_eq!(
+            strip_workbook_prefix("'[b.xlsx]My Sheet'!$A$1"),
+            (Some("b.xlsx".into()), "'My Sheet'!$A$1".into())
+        );
+        assert_eq!(strip_workbook_prefix("Tables!$A$1"), (None, "Tables!$A$1".into()));
+        assert_eq!(strip_workbook_prefix("A1:B2"), (None, "A1:B2".into()));
+        // Bracket after the '!' is not a workbook qualifier
+        assert_eq!(strip_workbook_prefix("Tables!A[1]"), (None, "Tables!A[1]".into()));
+    }
+
+    #[test]
+    fn test_normalize_strips_workbook_prefix() {
+        assert_eq!(
+            normalize_range_ref("[rpm_2025_Indonesia_v5.xlsx]Tables!$V$778:$Y$778"),
+            "Tables!V778:Y778"
+        );
+        assert_eq!(
+            normalize_range_ref("([b.xlsx]Tables!$C$10,[b.xlsx]Tables!$F$10)"),
+            "Tables!C10,Tables!F10"
+        );
+        assert_eq!(normalize_range_ref("'[b.xlsx]My Sheet'!$A$1"), "'My Sheet'!A1");
+    }
+
+    /// Chart 31 shape: tx, cat and val formulas all name the workbook.
+    fn qualified_chart() -> &'static str {
+        r#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+<c:chart><c:plotArea><c:barChart>
+<c:ser><c:tx><c:strRef><c:f>[rpm_2025_Indonesia_v5.xlsx]Tables!$V$776</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>Market</c:v></c:pt></c:strCache></c:strRef></c:tx>
+<c:cat><c:strRef><c:f>[rpm_2025_Indonesia_v5.xlsx]Tables!$V$777:$Y$777</c:f><c:strCache><c:ptCount val="4"/>
+<c:pt idx="0"><c:v>A</c:v></c:pt><c:pt idx="1"><c:v>B</c:v></c:pt><c:pt idx="2"><c:v>C</c:v></c:pt><c:pt idx="3"><c:v>D</c:v></c:pt></c:strCache></c:strRef></c:cat>
+<c:val><c:numRef><c:f>[rpm_2025_Indonesia_v5.xlsx]Tables!$V$778:$Y$778</c:f>
+<c:numCache><c:formatCode>0%</c:formatCode><c:ptCount val="4"/>
+<c:pt idx="0"><c:v>0.12</c:v></c:pt><c:pt idx="1"><c:v>0.27</c:v></c:pt><c:pt idx="3"><c:v>0.05</c:v></c:pt>
+</c:numCache></c:numRef></c:val></c:ser>
+</c:barChart></c:plotArea></c:chart></c:chartSpace>"#
+    }
+
+    #[test]
+    fn test_rewrite_strips_prefix_from_all_formulas_and_rebuilds_values() {
+        // Excel map is keyed by the PLAIN ref (as collect_unique_ranges produces it)
+        let m = vals("Tables!V778:Y778", vec![Some(0.1), Some(0.26), Some(0.2), Some(0.09)]);
+        let (out, st) = rewrite_chart_cache(qualified_chart().as_bytes(), &m).unwrap();
+        let s = String::from_utf8(out).unwrap();
+
+        assert_eq!(st.series_updated, 1);
+        assert_eq!(st.formulas_fixed, 3, "tx + cat + val formulas rewritten");
+        assert_eq!(st.book.as_deref(), Some("rpm_2025_Indonesia_v5.xlsx"));
+
+        assert!(!s.contains('['), "no workbook qualifier may survive: {s}");
+        assert!(s.contains("<c:f>Tables!$V$776</c:f>"));
+        assert!(s.contains("<c:f>Tables!$V$777:$Y$777</c:f>"));
+        assert!(s.contains("<c:f>Tables!$V$778:$Y$778</c:f>"));
+
+        // Values rebuilt from France, blank at idx 2 filled (GOTCHA #43)
+        assert_eq!(pt_count_of(&s), 4);
+        assert_eq!(pts_of(&s), vec![
+            (0, "0.1".into()), (1, "0.26".into()), (2, "0.2".into()), (3, "0.09".into()),
+        ]);
+        // Category cache untouched (GOTCHA #23)
+        assert!(s.contains("<c:v>C</c:v>"));
+    }
+
+    #[test]
+    fn test_collect_unique_ranges_strips_prefix() {
+        let mut chart_ranges = HashMap::new();
+        chart_ranges.insert("chart99.xml".to_string(), vec![
+            "[rpm_2025_Indonesia_v5.xlsx]Tables!$V$778:$Y$778".to_string(),
+        ]);
+        let unique = collect_unique_ranges(&chart_ranges);
+        assert_eq!(unique, vec!["Tables!V778:Y778".to_string()]);
+    }
+
+    #[test]
+    fn test_rewrite_plain_chart_reports_no_fix() {
+        let xml = chart_with_cache(r#"<c:ptCount val="1"/><c:pt idx="0"><c:v>0.5</c:v></c:pt>"#);
+        let m = vals("Tables!B1:B4", vec![Some(0.7)]);
+        let (_, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
+        assert_eq!(st.formulas_fixed, 0);
+        assert_eq!(st.book, None);
     }
 
     #[test]
