@@ -102,6 +102,13 @@ oa update --pair us_report.pptx=us_data.xlsx --pair mx_report.pptx=mx_data.xlsx
 # Override config values
 oa update report.pptx -e data.xlsx --set ccst.positive_color=#00FF00
 
+# Delta dead bands (decimal: 0.02 = 2 points). Tokens match a whole word of the OLE name,
+# so globalnet covers globalnet_pet / globalnet_dig, and delt_ vs delt2_ makes no difference.
+oa update report.pptx -e data.xlsx --set delta.threshold.globalnet=0.02 --set delta.threshold.marketnet=0.05
+
+# Global dead band for every delta, with one category overridden
+oa update report.pptx -e data.xlsx --set delta.threshold=0.02 --set delta.threshold.marketnet=0.05
+
 # Dry run: see what would happen without saving
 oa update report.pptx -e data.xlsx --dry-run
 
@@ -145,10 +152,13 @@ default_output = "output/{name}.pptx"
 # Optional: limit which pipeline steps run (default: all)
 steps = ["links", "tables", "deltas", "coloring", "charts"]
 
-# Optional: config overrides (same keys as --set)
+# Optional: config overrides (same keys as --set). Quote the dotted keys —
+# an unquoted `ccst.positive_prefix` is parsed by TOML as a nested table and rejected.
 [config]
-ccst.positive_prefix = ""
-links.set_manual = true
+"ccst.positive_prefix" = ""
+"links.set_manual" = true
+"delta.threshold.globalnet" = 0.02
+"delta.threshold.marketnet" = 0.05
 
 # Jobs: template path → { job_name = excel_path }
 [jobs."templates/region1_template.pptx"]
@@ -249,6 +259,10 @@ oa check <FILE> [OPTIONS]
 ```bash
 # Check a single file against specific Excel
 oa check report.pptx -e data.xlsx
+
+# Deltas updated with thresholds must be checked with the SAME --set values,
+# otherwise the dead-band deltas are reported as mismatches
+oa check report.pptx -e data.xlsx --set delta.threshold.globalnet=0.02 --set delta.threshold.marketnet=0.05
 
 # Auto-detect Excel from OLE links
 oa check report.pptx
@@ -406,7 +420,7 @@ oa config
 |---------|------|-------------|
 | `heatmap.*` | 5 keys | Colors for 3-color scale heatmap tables (htmp_) |
 | `ccst.*` | 5 keys | Sign-based color coding (_ccst tables) |
-| `delta.*` | 4 keys | Delta indicator template shape names and source slide |
+| `delta.*` | 5 keys + `delta.threshold.<token>` | Delta template shape names, source slide, and sign dead bands (`delta.threshold` global, `delta.threshold.<token>` per OLE-name token, e.g. `--set delta.threshold.globalnet=0.02`) |
 | `links.*` | 1 key | OLE link update behavior |
 
 ---

@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::error::{OaError, OaResult};
 use crate::office::constants::MsoTriState;
 use crate::pipeline::color_coder::parse_numeric;
-use crate::pipeline::delta_updater::determine_sign;
+use crate::pipeline::delta_updater::{determine_sign, sign_with_threshold};
 use crate::pipeline::table_updater::open_or_get_workbook;
 
 /// Series data: Vec of (range_ref, cached_values) per chart.
@@ -169,7 +169,7 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config, ver
     if let Some(sp) = sp { sp.finish_and_clear(); }
 
     let sp = if !verbose { Some(make_check_spinner("Deltas")) } else { None };
-    check_deltas(&inventory, &mut excel_app, &excel_str, &mut result);
+    check_deltas(&inventory, &mut excel_app, &excel_str, config, &mut result);
     if let Some(sp) = sp { sp.finish_and_clear(); }
 
     let sp = if !verbose { Some(make_check_spinner("Charts")) } else { None };
@@ -277,7 +277,7 @@ pub fn run_check_with_session(
     if let Some(sp) = sp { sp.finish_and_clear(); }
 
     let sp = if !verbose { Some(make_check_spinner("Deltas")) } else { None };
-    check_deltas(&inventory, &mut session.excel_app, &excel_str, &mut result);
+    check_deltas(&inventory, &mut session.excel_app, &excel_str, config, &mut result);
     if let Some(sp) = sp { sp.finish_and_clear(); }
 
     let sp = if !verbose { Some(make_check_spinner("Charts")) } else { None };
@@ -642,12 +642,12 @@ fn check_tables(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path
 /// Validate delta arrows: the shape's trailing `_pos/_neg/_none` must match the sign of
 /// the linked Excel cell. Works for every template set (`delt_`, `delt2_`, ...) because
 /// set recognition lives in the inventory (`matcher::delta_set`) and only the suffix is read here.
-fn check_deltas(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path: &str, result: &mut CheckResult) {
+fn check_deltas(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path: &str, config: &Config, result: &mut CheckResult) {
     let mut workbooks = match excel_app.get("Workbooks").and_then(|v| v.as_dispatch()).map(Dispatch::new) {
         Ok(wb) => wb, Err(_) => return,
     };
     for ole_ref in &inventory.ole_shapes {
-        if ole_ref.slide_index <= 1 { continue; }
+        if ole_ref.slide_index <= config.delta.template_slide { continue; }
         let key = (ole_ref.slide_index, ole_ref.name.clone());
         let delt_ref = match inventory.delts.get(&key) { Some(d) => d, None => continue };
         let actual_sign = if delt_ref.name.ends_with("_pos") { "pos" }
@@ -660,32 +660,52 @@ fn check_deltas(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path
         };
         let parts = parse_source_full_name(&source_full);
         if parts.range_address == "Not Specified" || parts.sheet_name == "Not Specified" { continue; }
-        let excel_text = {
-            let mut wb = match open_or_get_workbook(&mut workbooks, excel_path) { Ok(wb) => wb, Err(_) => continue };
-            wb.get("Worksheets").and_then(|v| v.as_dispatch())
-                .and_then(|d| Dispatch::new(d).call("Item", &[Variant::from(parts.sheet_name.as_str())]))
-                .and_then(|v| v.as_dispatch())
-                .and_then(|d| Dispatch::new(d).call("Range", &[Variant::from(parts.range_address.as_str())]))
-                .and_then(|v| v.as_dispatch())
-                .and_then(|d| Dispatch::new(d).call("Cells", &[Variant::from(1i32), Variant::from(1i32)]))
-                .and_then(|v| v.as_dispatch())
-                .and_then(|d| Dispatch::new(d).get("Text"))
-                .and_then(|v| v.as_string()).unwrap_or_default()
+        let mut wb = match open_or_get_workbook(&mut workbooks, excel_path) { Ok(wb) => wb, Err(_) => continue };
+        let mut cell = match wb.get("Worksheets").and_then(|v| v.as_dispatch())
+            .and_then(|d| Dispatch::new(d).call("Item", &[Variant::from(parts.sheet_name.as_str())]))
+            .and_then(|v| v.as_dispatch())
+            .and_then(|d| Dispatch::new(d).call("Range", &[Variant::from(parts.range_address.as_str())]))
+            .and_then(|v| v.as_dispatch())
+            .and_then(|d| Dispatch::new(d).call("Cells", &[Variant::from(1i32), Variant::from(1i32)]))
+            .and_then(|v| v.as_dispatch())
+            .map(Dispatch::new)
+        {
+            Ok(c) => c, Err(_) => continue,
         };
-        let expected_sign = determine_sign(&excel_text);
+
+        // Same rule as the updater (GOTCHA #45): threshold > 0 → numeric Value2 with dead band;
+        // threshold 0 → legacy display-text sign test.
+        let (threshold, token) = config.delta.threshold_for(&ole_ref.name);
+        let (expected_sign, shown) = if threshold > 0.0 {
+            let num = cell.get("Value2").ok()
+                .and_then(|v| v.as_flat_opt_f64_vec().ok())
+                .and_then(|vals| vals.first().copied().flatten());
+            match num {
+                Some(v) => (sign_with_threshold(v, threshold), format!("{v}")),
+                None => ("none", "(text)".to_string()),
+            }
+        } else {
+            let excel_text = cell.get("Text").and_then(|v| v.as_string()).unwrap_or_default();
+            (determine_sign(&excel_text), excel_text)
+        };
+        let thr_note = match (threshold > 0.0, token) {
+            (true, Some(tok)) => format!(", thr={threshold} via {tok}"),
+            (true, None) => format!(", thr={threshold}"),
+            _ => String::new(),
+        };
         result.delt_checked += 1;
         if actual_sign != expected_sign {
             result.delt_mismatches.push(Mismatch {
                 slide: ole_ref.slide_index, shape: delt_ref.name.clone(), category: "delta".into(),
-                detail: format!("actual={actual_sign}, expected={expected_sign} (value: {excel_text:?})"),
+                detail: format!("actual={actual_sign}, expected={expected_sign} (value: {shown:?}{thr_note})"),
             });
             crate::pipeline::verbose::check_detail(
                 ole_ref.slide_index, "delta", &delt_ref.name, false,
-                &format!("sign={actual_sign} expected={expected_sign} ({excel_text})"));
+                &format!("sign={actual_sign} expected={expected_sign} ({shown}{thr_note})"));
         } else {
             crate::pipeline::verbose::check_detail(
                 ole_ref.slide_index, "delta", &delt_ref.name, true,
-                &format!("sign={actual_sign} ({excel_text})"));
+                &format!("sign={actual_sign} ({shown}{thr_note})"));
         }
     }
 }

@@ -108,7 +108,7 @@ The update pipeline runs these steps in order:
 |------|-------------|
 | **Links** | Re-point OLE links to the new Excel file |
 | **Tables** | Populate PPT table cells from Excel ranges |
-| **Deltas** | Swap delta indicator arrows based on value sign |
+| **Deltas** | Swap delta indicator arrows based on value sign, with optional dead-band thresholds (see below) |
 | **Coloring** | Apply sign-based color coding to _ccst tables |
 | **Charts** | Rebuild each chart's data cache from Excel and re-point links; blank cells draw nothing, a real 0 draws a zero bar; series formulas that name a workbook (`[book.xlsx]Sheet!Range`) are normalised and reported as a warning |
 
@@ -148,6 +148,50 @@ The OLE name and the `_pos/_neg/_none` suffix work exactly as for `delt_`, e.g.
 `delt2_Rev_DE_pos`. If a set's templates are missing, that set is skipped with a
 warning and other sets still update. `oa info` lists every set found and its templates;
 `oa check` validates all sets.
+
+### Delta thresholds
+
+By default a delta is `pos` when the cell is `> 0`, `neg` when `< 0`, else `none`. Net-opinion
+cells are built from rounded percentages, so tiny deltas are noise. A dead band turns them into
+`none`: with threshold `t`, `value >= t` is `pos`, `value <= -t` is `neg`, anything strictly in
+between is `none`.
+
+Thresholds are config keys. `delta.threshold` applies to every delta; `delta.threshold.<token>`
+applies to deltas whose paired OLE object name contains `<token>` as a whole word (`_` counts as
+a word boundary, so `globalnet` covers `globalnet_pet` and `globalnet_dig` but not
+`globalnetwork`). When several tokens match, the longest wins.
+
+```bash
+# CLI: one --set per key
+oa update report.pptx -e france.xlsx --set delta.threshold.globalnet=0.02 --set delta.threshold.marketnet=0.05
+```
+
+```toml
+# TOML runfile — keys contain dots, so quote them
+[config]
+"delta.threshold.globalnet" = 0.02
+"delta.threshold.marketnet" = 0.05
+```
+
+```python
+# Python runfile
+config = {"delta.threshold.globalnet": 0.02, "delta.threshold.marketnet": 0.05}
+```
+
+Values are always decimals, read numerically from Excel: a cell typed as a percentage and
+showing `2%` is `0.02`. With the two thresholds above:
+
+| Cell shows | Read as | `globalnet` (0.02) | `marketnet` (0.05) |
+|-----------|---------|--------------------|--------------------|
+| -3% | -0.03 | neg | none |
+| -2% | -0.02 | neg (boundary is inclusive) | none |
+| -5% | -0.05 | neg | neg |
+| -1% | -0.01 | none | none |
+
+A text or blank cell under a threshold prints a warning and sets the delta to `none`. Deltas with
+threshold `0` (the default) keep the original sign test unchanged. Run `oa check` with the same
+`--set` values, otherwise it reports the dead-band deltas as mismatches. `-v` shows the threshold
+and token used per delta (`-0.02 → neg · thr 0.02 via globalnet`).
 
 ## Performance
 

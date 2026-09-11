@@ -72,6 +72,15 @@ Shape names can be duplicated across slides (e.g., two slides both have an OLE n
 ### #42 Numbered Delta Template Sets (Rust-specific)
 A delta shape's template set is derived from its name: `delt_` / `delt1_` = set 1 (the configured `tmpl_delta_*` names), `delt<N>_` = set N, which copies from `tmpl<N>_delta_{pos,neg,none}` on the same template slide. Always detect deltas with `matcher::delta_set(name)`, never `contains("delt_")` — the literal misses `delt2_`. If any template of a set is missing, that set is skipped with a warning; it must never fall back to set 1 (that would paste the wrong arrow style silently). Unchanged limitation: one delta shape per OLE per slide — a second `delt*_` shape naming the same OLE on the same slide is never paired, updated, or checked.
 
+### #45 Delta Thresholds Read Excel `Value2`, Always Decimal (Rust-specific)
+Net-opinion deltas are computed from rounded percentages, so `±1%` is noise. `delta.threshold` (global) and `delta.threshold.<token>` (per whole-word token of the paired **OLE** name — `_` is a boundary, so `globalnet` covers `globalnet_pet`; longest matching token wins) define a dead band: `v >= t` pos, `v <= -t` neg, else none (inclusive, 1e-9 tolerance).
+
+**Units:** thresholds are decimals because the value is read numerically with `Range.Value2`: a percentage-typed cell showing `54%` returns `0.54` (Double), a plain number returns itself, text returns a String. Verified on France `Tables!B100` (`Global` → String) and `B101` (`54%` → `0.54`). No `%` string parsing exists on this path. GOTCHA #16 (`.Text` for display strings) is about heatmap/table formatting and does **not** apply here.
+
+**Scope:** only deltas whose effective threshold is `> 0` take the numeric path (`get_delta_number` in `delta_updater.rs`). Threshold `0` (default) keeps the legacy `get_delta_value` → `determine_sign` text path byte-for-byte, so existing decks are unaffected. A text/blank cell under a threshold → `verbose::warn` + `none`.
+
+**Check parity:** `check_deltas` applies the same rule via `config.delta.threshold_for`, so `oa check` must be run with the same `--set` values or the dead-band deltas show as mismatches (that is also how you prove update and check agree). `check_deltas` now honours `delta.template_slide` instead of a hard-coded slide 1.
+
 ## Table Operations
 
 ### #7 Float Precision in Contrast Color

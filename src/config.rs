@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 
 use crate::error::{OaError, OaResult};
+use crate::shapes::matcher::is_exact_token_match;
 
 /// Heatmap color configuration for 3-color scale tables (htmp_ shapes).
 #[derive(Debug, Clone, Deserialize)]
@@ -53,6 +56,12 @@ pub struct DeltaConfig {
     pub template_negative: String,
     pub template_none: String,
     pub template_slide: i32,
+    /// Global dead band (GOTCHA #45): `|value| < threshold` → "none". `0` = plain sign test.
+    /// Decimal units, matching Excel `Value2` (a `2%` cell is `0.02`).
+    pub threshold: f64,
+    /// Per-category dead bands keyed by a whole token of the paired OLE object name,
+    /// e.g. `globalnet` → covers `globalnet_pet` and `globalnet_dig`. Longest matching token wins.
+    pub thresholds: BTreeMap<String, f64>,
 }
 
 impl Default for DeltaConfig {
@@ -62,7 +71,34 @@ impl Default for DeltaConfig {
             template_negative: "tmpl_delta_neg".into(),
             template_none: "tmpl_delta_none".into(),
             template_slide: 1,
+            threshold: 0.0,
+            thresholds: BTreeMap::new(),
         }
+    }
+}
+
+impl DeltaConfig {
+    /// Effective threshold for a delta paired with `ole_name`, and the token that supplied it
+    /// (`None` = the global `delta.threshold`). Tokens match whole words only
+    /// (`matcher::is_exact_token_match`); when several match, the longest wins, ties alphabetical.
+    pub fn threshold_for(&self, ole_name: &str) -> (f64, Option<&str>) {
+        let best = self.thresholds.iter()
+            .filter(|(token, _)| is_exact_token_match(ole_name, token))
+            .max_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| b.cmp(a)));
+        match best {
+            Some((token, value)) => (*value, Some(token.as_str())),
+            None => (self.threshold, None),
+        }
+    }
+}
+
+/// Parse a threshold value: finite and `>= 0`.
+fn parse_threshold(key: &str, value: &str) -> OaResult<f64> {
+    match value.parse::<f64>() {
+        Ok(v) if v.is_finite() && v >= 0.0 => Ok(v),
+        _ => Err(OaError::Config(format!(
+            "Invalid threshold for {key}: {value:?} (expected a number >= 0, e.g. 0.02)"
+        ))),
     }
 }
 
@@ -122,6 +158,19 @@ impl Config {
                         OaError::Config(format!("Invalid integer for delta.template_slide: {value:?}"))
                     })?;
                 }
+                "delta.threshold" => {
+                    self.delta.threshold = parse_threshold(key, value)?;
+                }
+                k if k.starts_with("delta.threshold.") => {
+                    let token = k["delta.threshold.".len()..].trim();
+                    if token.is_empty() {
+                        return Err(OaError::Config(
+                            "Empty token in delta.threshold.<token> (e.g. delta.threshold.globalnet=0.02)".into(),
+                        ));
+                    }
+                    let v = parse_threshold(key, value)?;
+                    self.delta.thresholds.insert(token.to_string(), v);
+                }
                 // Links
                 "links.set_manual" => {
                     self.links.set_manual = coerce_bool(value).ok_or_else(|| {
@@ -137,8 +186,9 @@ impl Config {
     }
 
     /// All valid config keys and their current values, for `oa config`.
-    pub fn all_keys(&self) -> Vec<(&'static str, String)> {
-        vec![
+    /// Per-token `delta.threshold.<token>` entries are appended when present.
+    pub fn all_keys(&self) -> Vec<(String, String)> {
+        let mut keys: Vec<(String, String)> = vec![
             ("heatmap.color_minimum", self.heatmap.color_minimum.clone()),
             ("heatmap.color_midpoint", self.heatmap.color_midpoint.clone()),
             ("heatmap.color_maximum", self.heatmap.color_maximum.clone()),
@@ -153,8 +203,16 @@ impl Config {
             ("delta.template_negative", self.delta.template_negative.clone()),
             ("delta.template_none", self.delta.template_none.clone()),
             ("delta.template_slide", self.delta.template_slide.to_string()),
+            ("delta.threshold", self.delta.threshold.to_string()),
             ("links.set_manual", self.links.set_manual.to_string()),
         ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        for (token, v) in &self.delta.thresholds {
+            keys.push((format!("delta.threshold.{token}"), v.to_string()));
+        }
+        keys
     }
 }
 
@@ -171,9 +229,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_config_has_all_15_keys() {
+    fn test_default_config_has_all_16_keys() {
         let config = Config::default();
-        assert_eq!(config.all_keys().len(), 15);
+        assert_eq!(config.all_keys().len(), 16);
+        assert!(config.all_keys().iter().any(|(k, v)| k == "delta.threshold" && v == "0"));
+    }
+
+    // ── GOTCHA #45: delta thresholds ───────────────────────
+
+    #[test]
+    fn test_delta_threshold_global_override() {
+        let mut config = Config::default();
+        config.apply_overrides(&["delta.threshold=0.02".into()]).unwrap();
+        assert_eq!(config.delta.threshold, 0.02);
+        assert_eq!(config.delta.threshold_for("anything"), (0.02, None));
+    }
+
+    #[test]
+    fn test_delta_threshold_per_token_override_and_listing() {
+        let mut config = Config::default();
+        config.apply_overrides(&[
+            "delta.threshold.globalnet=0.02".into(),
+            "delta.threshold.marketnet=0.05".into(),
+            "delta.threshold.globalnet=0.03".into(), // later --set replaces earlier
+        ]).unwrap();
+        assert_eq!(config.delta.thresholds.len(), 2);
+        assert_eq!(config.delta.thresholds["globalnet"], 0.03);
+        let keys = config.all_keys();
+        assert!(keys.iter().any(|(k, v)| k == "delta.threshold.globalnet" && v == "0.03"));
+        assert!(keys.iter().any(|(k, v)| k == "delta.threshold.marketnet" && v == "0.05"));
+    }
+
+    #[test]
+    fn test_delta_threshold_rejects_bad_values() {
+        for bad in ["delta.threshold=-0.01", "delta.threshold=abc", "delta.threshold=NaN",
+                    "delta.threshold.globalnet=-1", "delta.threshold.globalnet=x",
+                    "delta.threshold.=0.02", "delta.thresholdx=0.02"] {
+            let mut config = Config::default();
+            assert!(config.apply_overrides(&[bad.into()]).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_threshold_for_whole_token_matching() {
+        let mut config = Config::default();
+        config.apply_overrides(&[
+            "delta.threshold=0.01".into(),
+            "delta.threshold.globalnet=0.02".into(),
+            "delta.threshold.marketnet=0.05".into(),
+        ]).unwrap();
+        let d = &config.delta;
+        // `_` is a token boundary: one token covers the whole category
+        assert_eq!(d.threshold_for("globalnet_pet"), (0.02, Some("globalnet")));
+        assert_eq!(d.threshold_for("globalnet_dig"), (0.02, Some("globalnet")));
+        assert_eq!(d.threshold_for("marketnet_pet"), (0.05, Some("marketnet")));
+        assert_eq!(d.threshold_for("Object_globalnet"), (0.02, Some("globalnet")));
+        // whole token only — no substring matches
+        assert_eq!(d.threshold_for("globalnetwork"), (0.01, None));
+        assert_eq!(d.threshold_for("Object_edu"), (0.01, None));
+    }
+
+    #[test]
+    fn test_threshold_for_longest_token_wins() {
+        let mut config = Config::default();
+        config.apply_overrides(&[
+            "delta.threshold.net=0.01".into(),
+            "delta.threshold.global_net=0.04".into(),
+        ]).unwrap();
+        // both `net` and `global_net` are whole tokens of `Object_global_net`
+        assert_eq!(config.delta.threshold_for("Object_global_net"), (0.04, Some("global_net")));
+        assert_eq!(config.delta.threshold_for("market_net"), (0.01, Some("net")));
     }
 
     #[test]

@@ -18,10 +18,12 @@ t1 = "templates/market_report_template.pptx"
 # Optional: only run specific pipeline steps (default: all)
 # steps = ["links", "tables", "deltas", "coloring", "charts"]
 
-# Optional: config overrides
+# Optional: config overrides (quote the dotted keys)
 # [config]
-# ccst.positive_prefix = ""
-# links.set_manual = true
+# "ccst.positive_prefix" = ""
+# "links.set_manual" = true
+# "delta.threshold" = 0.02              # dead band for every delta (decimal: 0.02 = 2 points)
+# "delta.threshold.globalnet" = 0.02    # per OLE-name token (whole word), longest token wins
 
 # --- Jobs ---
 
