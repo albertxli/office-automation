@@ -20,6 +20,9 @@ oa info report.pptx
 # Per-slide shape breakdown
 oa info -v report.pptx
 
+# Search text inside a PPTX (no PowerPoint needed; exit 1 = not found)
+oa find report.pptx -t "[country]"
+
 # Show all config keys and defaults
 oa config
 
@@ -422,6 +425,57 @@ oa diff us_report.pptx mx_report.pptx
 
 ---
 
+### `oa find` — Search text inside a PPTX
+
+Read-only, ZIP-level scan (no PowerPoint, no Excel). Lists every occurrence of the given text
+with its location, shape name and a snippet. Runs in milliseconds even on a 70-slide deck.
+
+```
+oa find <FILE> -t <TEXT> [-t <TEXT>...] [-i]
+```
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `-t, --text <TEXT>` | Text to look for, literal (repeatable, required) |
+| `-i, --ignore-case` | Case-insensitive matching |
+
+**What it scans:** every slide (in presentation order), each slide's speaker notes, every slide
+layout and every slide master. Grouped shapes and table cells are included. Text is joined per
+paragraph before matching, so a phrase PowerPoint stored across several formatting runs is
+still found. `-t` is the first selector; charts or shapes by name may be added later.
+
+**Examples:**
+
+```bash
+# Did the replace step catch every token?  (exit 1 means none left)
+oa find out/japan.pptx -t "[country]"
+
+# Several needles at once — one section per needle
+oa find template.pptx -t "[country]" -t "[wave]"
+
+# Case-insensitive
+oa find report.pptx -i -t japan
+```
+
+**Example output:**
+
+```
+  ▸ template.pptx
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+
+  Slide  1           │ TextBox 3                Market Report: [country]
+  Slide  3           │ TextBox 60               Geography: [country]
+  Slide  5           │ TextBox 5                Key findings: [country]
+  Layout Title Slide │ LayoutFooter             Layout footer for [country]
+  ✓ 4 hits for "[country]" · 5 slides · 2 layouts · 2 masters · 3 notes · 0.01s
+```
+
+**Exit codes:** `0` at least one hit · `1` no hits · `2` error (file not found, not a PPTX).
+
+---
+
 ### `oa config` — Show config keys and defaults
 
 Prints all available `--set` keys with their default values.
@@ -496,7 +550,7 @@ When no processes found:
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Validation failure (`oa check` found mismatches) |
+| 1 | Validation failure (`oa check` found mismatches) or no hits (`oa find`) |
 | 2 | Runtime error (bad arguments, missing files, COM failure) |
 
 ---
@@ -533,6 +587,7 @@ The pipeline identifies shapes by name prefix/suffix:
 | ZIP pre-relink (411 links) | 0.1s |
 | ZIP chart pre-update (257 charts) | 0.3s |
 | `oa info` inspection | ~3s |
+| `oa find` text search (71-slide deck, ZIP only) | ~0.03s |
 | `oa check` single file | ~4s |
 | `oa check` batch (6 files via runfile) | ~28s |
 | `oa clean` (no processes) | instant |

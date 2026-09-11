@@ -66,6 +66,14 @@ fn main() {
         Commands::Info(args) => {
             commands::info::run_info(&args.file, args.verbose).map_err(|e| e.to_string())
         }
+        Commands::Find(args) => {
+            // grep semantics: 0 = found, 1 = nothing found, 2 = error (below)
+            match commands::find::run_find(&args.file, &args.text, args.ignore_case) {
+                Ok(0) => std::process::exit(1),
+                Ok(_) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
         Commands::Clean(args) => {
             commands::clean::run_clean(args.force).map_err(|e| e.to_string())
         }

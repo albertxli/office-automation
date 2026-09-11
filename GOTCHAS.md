@@ -93,6 +93,17 @@ The `replace` step (`text_replacer.rs`) uses `TextRange.Replace(FindWhat, Replac
 - After `Replace`, PowerPoint may split the original run (`Market Report: [country]` → `Market Report` + `: Japan`). Visually identical; do not compare `<a:t>` counts before/after.
 - A token with zero hits across the whole deck is reported with `verbose::warn` — it is almost always a typo in the token or the template.
 
+### #47 Reading Slide Text from XML (`oa find`, Rust-specific)
+`zip_ops::slide_text` is the first code that reads `<a:t>` text out of the PPTX without COM. Rules learned:
+
+- **Join every `<a:t>` inside one `<a:p>` before matching.** PowerPoint splits a sentence into runs at arbitrary points (spell-check, a bold word, a pasted fragment): `positive ` + ` change`. Matching run by run misses phrases; the COM replace step has the same issue (GOTCHA #46).
+- **Shape name = nearest preceding `<p:cNvPr name="…">`.** Grouped shapes therefore report the child's name; table cells (`<a:tc>` inside a `graphicFrame`) inherit the table's name. The spTree itself has a `cNvPr` with an empty name — harmless because every real shape overrides it.
+- **Notes parts are numbered independently of slides** (`notesSlide7.xml` can belong to slide 3, a 68-slide deck may have 11 notes parts). Resolve via `ppt/slides/_rels/slideN.xml.rels` → the target containing `notesSlides/`.
+- Layout names live in `<p:cSld name="Title Slide">`; masters usually have no name there → label them by part number.
+- `<a:fld>` (slide number, date fields) holds `<a:t>` too and must be included; `<a:br/>` is a line break inside the paragraph.
+- quick-xml ≥ 0.37 delivers `&amp;`/`&#x2019;` as separate `Event::GeneralRef` events, not inside `Event::Text` — resolve them or the joined text has holes.
+- Match on **char** indices, not byte offsets, so snippets and highlights stay aligned for non-ASCII text; case-insensitive mode folds each char individually to keep indices stable.
+
 ## Table Operations
 
 ### #7 Float Precision in Contrast Color

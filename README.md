@@ -58,6 +58,9 @@ oa info template.pptx
 
 # Per-slide shape breakdown
 oa info -v template.pptx
+
+# Where does a text token appear? (no PowerPoint needed; exit 1 = not found)
+oa find template.pptx -t "[country]"
 ```
 
 ## Commands
@@ -68,6 +71,7 @@ oa info -v template.pptx
 | `oa run` | Execute a TOML runfile for batch processing |
 | `oa check` | Validate PPT values against Excel source |
 | `oa info` | Inspect a PPTX file (read-only) |
+| `oa find` | Search text inside a PPTX (ZIP-level, no Office needed) |
 | `oa diff` | Compare two PPTX files side by side |
 | `oa config` | Show all config keys and defaults |
 | `oa clean` | Kill zombie Office processes |
@@ -232,6 +236,19 @@ split across formatting runs are still found. A token that matches nothing anywh
 prints a warning (`⚠ token "[wave]" was not found anywhere in the deck`), which is usually a typo.
 `-v` lists every hit: `Slide  1 │ TextBox 3   [country] → Japan (1)`. Python runfiles do not
 support `[replace]`.
+
+To verify a run, search the output with `oa find` (pure ZIP, no PowerPoint, milliseconds):
+
+```bash
+oa find out/japan.pptx -t "[country]"        # exit 1 = token is gone everywhere
+oa find out/japan.pptx -t Japan -t "Wave 3"   # where did the values land?
+oa find template.pptx -i -t japan             # case-insensitive
+```
+
+Each hit is listed as `Slide  3 │ TextBox 60   Geography: [country]`, with layouts, masters and
+speaker notes labelled `Layout Title Slide`, `Master 1`, `Notes  3`. Text split across formatting
+runs is joined per paragraph before matching, so a phrase is found even when PowerPoint stored it
+in pieces. Exit codes follow grep: 0 found, 1 not found, 2 error.
 
 ## Performance
 

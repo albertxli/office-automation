@@ -39,6 +39,18 @@ pub enum Commands {
     /// Inspect a PPTX file (read-only)
     Info(InfoArgs),
 
+    /// Search for text inside a PPTX (read-only, no PowerPoint needed)
+    #[command(
+        after_long_help = "Scans every slide, speaker-notes page, slide layout and slide master at ZIP level\n\
+            and lists each occurrence with its location, shape name and a snippet.\n\n\
+            EXIT CODES:\n  \
+            0  at least one hit\n  \
+            1  no hits (handy for scripts: `oa find out.pptx -t [country]` failing means the token is gone)\n  \
+            2  error (file not found, not a PPTX, ...)\n\n\
+            -t is the first selector; charts or shapes by name may be added later."
+    )]
+    Find(FindArgs),
+
     /// Kill zombie PowerPoint and Excel processes
     Clean(CleanArgs),
 
@@ -172,6 +184,21 @@ pub struct InfoArgs {
     /// Show per-slide breakdown
     #[arg(short, long)]
     pub verbose: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct FindArgs {
+    /// PPTX file to search
+    #[arg(value_name = "FILE")]
+    pub file: String,
+
+    /// Text to look for (literal, repeatable, e.g. -t [country] -t Wave)
+    #[arg(short = 't', long = "text", value_name = "TEXT", required = true)]
+    pub text: Vec<String>,
+
+    /// Case-insensitive matching
+    #[arg(short = 'i', long)]
+    pub ignore_case: bool,
 }
 
 #[derive(Parser, Debug)]
