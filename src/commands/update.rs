@@ -48,6 +48,12 @@ pub fn run_update_with_session(args: &UpdateArgs, session: &mut ComSession) -> O
     let mut config = Config::default();
     config.apply_overrides(&args.set)?;
 
+    // Text replacements: pre-parsed pairs from `oa run` first, then `-r FIND=VALUE` flags
+    let mut replacements: Vec<(String, String)> = args.replace_pairs.clone();
+    for raw in &args.replace {
+        replacements.push(crate::cli::parse_replacement(raw).map_err(OaError::Config)?);
+    }
+
     // Resolve file pairs
     let pairs = resolve_file_pairs(args)?;
     if pairs.is_empty() {
@@ -99,6 +105,7 @@ pub fn run_update_with_session(args: &UpdateArgs, session: &mut ComSession) -> O
             &pair.excel,
             &config,
             args,
+            &replacements,
         );
 
         match result {
@@ -138,6 +145,7 @@ fn process_single_file(
     excel_path: &Path,
     config: &Config,
     args: &UpdateArgs,
+    replacements: &[(String, String)],
 ) -> OaResult<PipelineResults> {
     let pptx_str = strip_unc(&pptx_path.canonicalize()?);
     let excel_str = strip_unc(&excel_path.canonicalize()?);
@@ -235,6 +243,7 @@ fn process_single_file(
         quiet,
         verbose,
         chart_data_ok,
+        replacements,
     );
 
     // Save (unless dry-run or pipeline failed)

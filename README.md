@@ -111,6 +111,7 @@ The update pipeline runs these steps in order:
 | **Deltas** | Swap delta indicator arrows based on value sign, with optional dead-band thresholds (see below) |
 | **Coloring** | Apply sign-based color coding to _ccst tables |
 | **Charts** | Rebuild each chart's data cache from Excel and re-point links; blank cells draw nothing, a real 0 draws a zero bar; series formulas that name a workbook (`[book.xlsx]Sheet!Range`) are normalised and reported as a warning |
+| **Replace** | Replace literal text tokens (`-r [country]=Japan`) across slides, masters and layouts; only runs when replacements are given (see below) |
 
 Steps can be selectively run or skipped:
 
@@ -192,6 +193,45 @@ A text or blank cell under a threshold prints a warning and sets the delta to `n
 threshold `0` (the default) keep the original sign test unchanged. Run `oa check` with the same
 `--set` values, otherwise it reports the dead-band deltas as mismatches. `-v` shows the threshold
 and token used per delta (`-0.02 → neg · thr 0.02 via globalnet`).
+
+### Text replacement
+
+Put a literal token such as `[country]` anywhere in the template and have it replaced after all
+other steps have run. Matching is literal and case-sensitive; the find string is whatever you
+type, so pick a marker that never occurs naturally in a report (`[[country]]` is safest, plain
+`[country]` works fine too).
+
+```bash
+# CLI: -r FIND=VALUE, repeatable (--replace is the long form)
+oa update report.pptx -e japan.xlsx -r [country]=Japan -r "[wave]=Wave 3"
+```
+
+```toml
+# TOML runfile: a global [replace] table, optionally overridden per job.
+# {name} expands to the job name, exactly as in default_output.
+[replace]
+"[country]" = "{name}"
+"[wave]" = "Wave 3"
+
+[[job]]
+name = "Japan"
+template = "t1"
+data = "rpm_2025_japan_v1.xlsx"
+
+[[job]]
+name = "France"
+template = "t1"
+data = "rpm_2025_france_v1.xlsx"
+replace = { "[country]" = "France (FR)" }   # wins over the global entry for this job
+```
+
+Scope: every shape on every slide (including grouped shapes and table cells), every slide master
+and every custom layout. Speaker notes are not touched. Replacement uses PowerPoint's own
+`TextRange.Replace`, so the formatting of the replaced text is kept and tokens that PowerPoint
+split across formatting runs are still found. A token that matches nothing anywhere in the deck
+prints a warning (`⚠ token "[wave]" was not found anywhere in the deck`), which is usually a typo.
+`-v` lists every hit: `Slide  1 │ TextBox 3   [country] → Japan (1)`. Python runfiles do not
+support `[replace]`.
 
 ## Performance
 

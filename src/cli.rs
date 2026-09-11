@@ -21,8 +21,9 @@ pub enum Commands {
             tables    Populate PPT tables from Excel ranges\n  \
             deltas    Swap delta indicator arrows based on sign\n  \
             coloring  Apply sign-based color coding (_ccst shapes)\n  \
-            charts    Update chart data links\n\n\
-            All steps run by default. Use --steps or --skip to control which run."
+            charts    Update chart data links\n  \
+            replace   Replace literal text tokens given with -r FIND=VALUE (slides, masters, layouts)\n\n\
+            All steps run by default (replace only does work when -r is given). Use --steps or --skip to control which run."
     )]
     Update(UpdateArgs),
 
@@ -78,6 +79,15 @@ pub struct UpdateArgs {
     /// Override a config value (repeatable, e.g. --set ccst.positive_color=#FF0000)
     #[arg(long, value_name = "KEY=VALUE")]
     pub set: Vec<String>,
+
+    /// Replace a literal text token everywhere (repeatable, e.g. -r [country]=Japan).
+    /// Case-sensitive; covers slides, slide masters and layouts.
+    #[arg(short = 'r', long, value_name = "FIND=VALUE")]
+    pub replace: Vec<String>,
+
+    /// Pre-parsed replacements supplied by `oa run` (not a CLI flag).
+    #[arg(skip)]
+    pub replace_pairs: Vec<(String, String)>,
 
     /// Run validation against Excel after processing
     #[arg(long)]
@@ -171,8 +181,22 @@ pub struct CleanArgs {
     pub force: bool,
 }
 
-/// The valid pipeline step names.
-pub const VALID_STEPS: &[&str] = &["links", "tables", "deltas", "coloring", "charts"];
+/// The valid pipeline step names (execution order).
+pub const VALID_STEPS: &[&str] = &["links", "tables", "deltas", "coloring", "charts", "replace"];
+
+/// Parse a `-r FIND=VALUE` replacement. Splits on the first `=` and trims both sides, so
+/// `"[country] = Japan"` works as well as `"[country]=Japan"`. The value may be empty
+/// (deletes the token); the find part may not.
+pub fn parse_replacement(s: &str) -> Result<(String, String), String> {
+    let Some((find, value)) = s.split_once('=') else {
+        return Err(format!("Invalid replacement {s:?} (expected FIND=VALUE, e.g. -r [country]=Japan)"));
+    };
+    let find = find.trim();
+    if find.is_empty() {
+        return Err(format!("Invalid replacement {s:?}: the text to find is empty"));
+    }
+    Ok((find.to_string(), value.trim().to_string()))
+}
 
 /// Resolve which steps to run from --steps and --skip flags.
 /// Returns an error if both are specified, or if unknown step names are used.
@@ -262,8 +286,19 @@ mod tests {
     #[test]
     fn test_resolve_steps_default_all() {
         let steps = resolve_steps(&[], &[]).unwrap();
-        assert_eq!(steps.len(), 5);
-        assert_eq!(steps, vec!["links", "tables", "deltas", "coloring", "charts"]);
+        assert_eq!(steps.len(), 6);
+        assert_eq!(steps, vec!["links", "tables", "deltas", "coloring", "charts", "replace"]);
+    }
+
+    #[test]
+    fn test_parse_replacement() {
+        assert_eq!(parse_replacement("[country]=Japan").unwrap(), ("[country]".into(), "Japan".into()));
+        assert_eq!(parse_replacement("[country] = Japan").unwrap(), ("[country]".into(), "Japan".into()));
+        assert_eq!(parse_replacement("[a]=x=y").unwrap(), ("[a]".into(), "x=y".into()), "only the first = splits");
+        assert_eq!(parse_replacement("[a]=").unwrap(), ("[a]".into(), String::new()), "empty value deletes the token");
+        assert!(parse_replacement("=x").is_err());
+        assert!(parse_replacement("  =x").is_err());
+        assert!(parse_replacement("[a]").is_err());
     }
 
     #[test]
@@ -275,7 +310,7 @@ mod tests {
     #[test]
     fn test_resolve_steps_skip() {
         let steps = resolve_steps(&[], &["charts".into()]).unwrap();
-        assert_eq!(steps, vec!["links", "tables", "deltas", "coloring"]);
+        assert_eq!(steps, vec!["links", "tables", "deltas", "coloring", "replace"]);
     }
 
     #[test]

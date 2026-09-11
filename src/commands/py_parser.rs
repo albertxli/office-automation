@@ -83,6 +83,7 @@ pub fn parse_py_runfile(content: &str) -> OaResult<RunFile> {
         default_output,
         steps,
         config,
+        replace: HashMap::new(), // text replacement is TOML-only
         job: Vec::new(),
         jobs: Some(jobs),
     })
@@ -227,7 +228,7 @@ fn parse_job_dict_value(value: &str) -> Option<JobValue> {
         .captures(value)?.get(1)?.as_str().to_string();
     let output = regex::Regex::new(r#""output"\s*:\s*"([^"]*)"#).ok()?
         .captures(value).map(|c| c[1].to_string());
-    Some(JobValue::Detailed { data, output })
+    Some(JobValue::Detailed { data, output, replace: HashMap::new() })
 }
 
 fn substitute_fstrings(s: String, variables: &HashMap<String, String>) -> String {

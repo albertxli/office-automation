@@ -81,6 +81,18 @@ Net-opinion deltas are computed from rounded percentages, so `±1%` is noise. `d
 
 **Check parity:** `check_deltas` applies the same rule via `config.delta.threshold_for`, so `oa check` must be run with the same `--set` values or the dead-band deltas show as mismatches (that is also how you prove update and check agree). `check_deltas` now honours `delta.template_slide` instead of a hard-coded slide 1.
 
+### #46 TextRange.Replace: Advance `After`, Nothing Is a Null Dispatch, Masters via Designs (Rust-specific)
+The `replace` step (`text_replacer.rs`) uses `TextRange.Replace(FindWhat, ReplaceWhat, After, MatchCase, WholeWords)` rather than assigning `.Text`, because it keeps the formatting of the replaced run and finds tokens PowerPoint has split across `<a:r>` runs (a ZIP-level `<a:t>` rewrite misses those and would have to run before `Open`).
+
+- `Replace` handles **one** occurrence per call and returns the replaced `TextRange`, or **Nothing** when there is no further match. Nothing arrives as a null `VT_DISPATCH`, so `Variant::as_dispatch()` failing is the normal loop exit — not an error to report.
+- Always pass `After = max(after, found.Start + found.Length - 1)`. Searching from 0 every time re-matches a token inside its own replacement (`[c]` → `[c]x`) forever. `Start` is 1-based.
+- `MatchCase`/`WholeWords` are `MsoTriState`: `-1` true, `0` false. Matching is literal, case-sensitive.
+- Read `.Text` once per shape and skip shapes containing none of the tokens — one COM call instead of N `Replace` probes; most shapes have no token.
+- Check `HasTable` **before** `HasTextFrame`: a table shape has no text frame of its own, only `Table.Cell(r,c).Shape` does. Groups (`Type == 6`) need explicit recursion via `GroupItems`.
+- Masters must be reached through `Presentation.Designs(i).SlideMaster` (multi-master decks have several); layouts through `SlideMaster.CustomLayouts(i)`. `Presentation.SlideMaster` only gives the first design.
+- After `Replace`, PowerPoint may split the original run (`Market Report: [country]` → `Market Report` + `: Japan`). Visually identical; do not compare `<a:t>` counts before/after.
+- A token with zero hits across the whole deck is reported with `verbose::warn` — it is almost always a typo in the token or the template.
+
 ## Table Operations
 
 ### #7 Float Precision in Contrast Color

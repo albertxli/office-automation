@@ -56,6 +56,7 @@ oa update <FILES...> [OPTIONS]
 | `--steps <STEP,...>` | Run only these steps (comma-separated) |
 | `--skip <STEP,...>` | Skip these steps (mutually exclusive with --steps) |
 | `--set <KEY=VALUE>` | Override a config value (repeatable) |
+| `-r, --replace <FIND=VALUE>` | Replace a literal text token everywhere (repeatable, case-sensitive; slides, masters, layouts). Spaces around `=` are ignored when quoted |
 | `--check` | Run validation against Excel after processing |
 | `--dry-run` | Show what would happen without saving |
 | `-v, --verbose` | Enable debug logging |
@@ -70,6 +71,7 @@ oa update <FILES...> [OPTIONS]
 | `deltas` | Yes | Swap delta indicator arrows based on sign |
 | `coloring` | No | Apply sign-based color coding (_ccst shapes) |
 | `charts` | Yes | Update chart data links |
+| `replace` | No | Replace literal text tokens given with `-r` / runfile `[replace]`; skipped silently when none are given |
 
 **Pre-pipeline ZIP operations** (run before COM, no PowerPoint needed):
 
@@ -108,6 +110,10 @@ oa update report.pptx -e data.xlsx --set delta.threshold.globalnet=0.02 --set de
 
 # Global dead band for every delta, with one category overridden
 oa update report.pptx -e data.xlsx --set delta.threshold=0.02 --set delta.threshold.marketnet=0.05
+
+# Replace literal text tokens after all other steps (-r is repeatable; --replace is the long form).
+# Covers slides, slide masters and layouts; a token found nowhere prints a warning.
+oa update report.pptx -e japan.xlsx -r [country]=Japan -r "[wave]=Wave 3"
 
 # Dry run: see what would happen without saving
 oa update report.pptx -e data.xlsx --dry-run
@@ -150,7 +156,7 @@ oa run <RUNFILE.toml> [OPTIONS]
 default_output = "output/{name}.pptx"
 
 # Optional: limit which pipeline steps run (default: all)
-steps = ["links", "tables", "deltas", "coloring", "charts"]
+steps = ["links", "tables", "deltas", "coloring", "charts", "replace"]
 
 # Optional: config overrides (same keys as --set). Quote the dotted keys —
 # an unquoted `ccst.positive_prefix` is parsed by TOML as a nested table and rejected.
@@ -160,20 +166,30 @@ steps = ["links", "tables", "deltas", "coloring", "charts"]
 "delta.threshold.globalnet" = 0.02
 "delta.threshold.marketnet" = 0.05
 
-# Jobs: template path → { job_name = excel_path }
-[jobs."templates/region1_template.pptx"]
-australia = "data/tracking_australia.xlsx"
-japan = "data/tracking_japan.xlsx"
-indonesia = "data/tracking_indonesia.xlsx"
+# Optional: literal text replacements applied after all other steps (same as -r).
+# {name} expands to the job name. A job may override an entry with its own `replace`.
+[replace]
+"[country]" = "{name}"
+"[wave]" = "Wave 3"
 
-[jobs."templates/region2_template.pptx"]
-germany = "data/tracking_germany.xlsx"
-france = "data/tracking_france.xlsx"
+# Template aliases, then one [[job]] per output file
+[templates]
+t1 = "templates/region1_template.pptx"
 
-# Per-job output override (use inline table)
-[jobs."templates/special_template.pptx"]
-usa = "data/tracking_usa.xlsx"
-canada = { data = "data/tracking_canada.xlsx", output = "special/canada_report.pptx" }
+[[job]]
+name = "Japan"
+template = "t1"
+data = "data/tracking_japan.xlsx"
+
+[[job]]
+name = "France"
+template = "t1"
+data = "data/tracking_france.xlsx"
+output = "special/france_report.pptx"          # per-job output override
+replace = { "[country]" = "France (FR)" }      # per-job replacement override
+
+# Legacy map form is still accepted: [jobs."template.pptx"] with
+# name = "data.xlsx"  or  name = { data = "...", output = "...", replace = { ... } }
 ```
 
 **Examples:**

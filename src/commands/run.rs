@@ -61,6 +61,10 @@ pub struct RunFile {
     /// Config overrides (`[config]` section). Optional.
     #[serde(default)]
     pub config: HashMap<String, toml::Value>,
+    /// Text replacements for every job (`[replace]` section): find → value.
+    /// `{name}` in a value expands to the job name. Optional.
+    #[serde(default)]
+    pub replace: HashMap<String, String>,
     /// Job list (`[[job]]` array). At least one required.
     #[serde(default)]
     pub job: Vec<Job>,
@@ -78,14 +82,22 @@ pub struct Job {
     pub data: String,
     #[serde(default)]
     pub output: Option<String>,
+    /// Per-job text replacements; override the global `[replace]` on the same key.
+    #[serde(default)]
+    pub replace: HashMap<String, String>,
 }
 
-/// Legacy job value (old format): either a plain string or `{data, output}`.
+/// Legacy job value (old format): either a plain string or `{data, output, replace}`.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum JobValue {
     Simple(String),
-    Detailed { data: String, output: Option<String> },
+    Detailed {
+        data: String,
+        output: Option<String>,
+        #[serde(default)]
+        replace: HashMap<String, String>,
+    },
 }
 
 impl JobValue {
@@ -102,6 +114,13 @@ impl JobValue {
             JobValue::Detailed { output, .. } => output.as_deref(),
         }
     }
+
+    pub fn replace_map(&self) -> Option<&HashMap<String, String>> {
+        match self {
+            JobValue::Simple(_) => None,
+            JobValue::Detailed { replace, .. } => Some(replace),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -110,6 +129,35 @@ pub struct ResolvedJob {
     pub template: PathBuf,
     pub excel: PathBuf,
     pub output: PathBuf,
+    /// Merged (global ← job) text replacements with `{name}` expanded, sorted by find.
+    pub replace: Vec<(String, String)>,
+}
+
+/// Merge the global `[replace]` table with a job's own `replace` (job wins on the same
+/// find string), expand `{name}` in values, and return a deterministic, sorted list.
+/// Empty find strings are dropped with a warning.
+fn merge_replacements(
+    global: &HashMap<String, String>,
+    job: Option<&HashMap<String, String>>,
+    job_name: &str,
+) -> Vec<(String, String)> {
+    let mut merged: std::collections::BTreeMap<String, String> = global.clone().into_iter().collect();
+    if let Some(job) = job {
+        for (k, v) in job {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    merged.into_iter()
+        .filter(|(find, _)| {
+            if find.trim().is_empty() {
+                eprintln!("Warning: job '{job_name}': ignoring replacement with an empty find string");
+                false
+            } else {
+                true
+            }
+        })
+        .map(|(find, value)| (find, value.replace("{name}", job_name)))
+        .collect()
 }
 
 /// Parse a runfile and resolve all jobs. Returns (jobs, config_overrides, steps).
@@ -179,6 +227,8 @@ pub fn run_runfile(
             steps,
             skip: Vec::new(),
             set: config_overrides.clone(),
+            replace: Vec::new(),
+            replace_pairs: job.replace.clone(),
             check: check_after,
             dry_run,
             verbose,
@@ -262,7 +312,8 @@ fn resolve_jobs_v2(runfile: &RunFile, base_dir: &Path) -> OaResult<Vec<ResolvedJ
             base_dir.join(format!("{}.pptx", job.name))
         };
 
-        jobs.push(ResolvedJob { name: job.name.clone(), template, excel, output });
+        let replace = merge_replacements(&runfile.replace, Some(&job.replace), &job.name);
+        jobs.push(ResolvedJob { name: job.name.clone(), template, excel, output, replace });
     }
 
     Ok(jobs)
@@ -294,7 +345,8 @@ fn resolve_jobs_legacy(
             } else {
                 base_dir.join(format!("{name}.pptx"))
             };
-            jobs.push(ResolvedJob { name: name.clone(), template: template.clone(), excel, output });
+            let replace = merge_replacements(&runfile.replace, value.replace_map(), name);
+            jobs.push(ResolvedJob { name: name.clone(), template: template.clone(), excel, output, replace });
         }
     }
     Ok(jobs)
@@ -504,6 +556,73 @@ data = "data.xlsx"
         let rf: RunFile = toml::from_str(toml_str).unwrap();
         assert_eq!(rf.steps.as_ref().unwrap(), &["links", "tables"]);
         assert_eq!(rf.config.len(), 1);
+    }
+
+    // --- Text replacement ([replace] + per-job replace) ---
+
+    #[test]
+    fn test_parse_v2_replace_global_and_per_job() {
+        let toml_str = r#"
+[replace]
+"[country]" = "{name}"
+"[wave]" = "Wave 3"
+
+[[job]]
+name = "Japan"
+template = "t.pptx"
+data = "japan.xlsx"
+
+[[job]]
+name = "France"
+template = "t.pptx"
+data = "france.xlsx"
+replace = { "[country]" = "France (FR)" }
+"#;
+        let rf: RunFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(rf.replace.len(), 2);
+        assert!(rf.job[0].replace.is_empty());
+        assert_eq!(rf.job[1].replace["[country]"], "France (FR)");
+
+        // Global only, {name} expanded, sorted by find string
+        let japan = merge_replacements(&rf.replace, Some(&rf.job[0].replace), "Japan");
+        assert_eq!(japan, vec![
+            ("[country]".to_string(), "Japan".to_string()),
+            ("[wave]".to_string(), "Wave 3".to_string()),
+        ]);
+
+        // Per-job override wins on the same find; other globals still apply
+        let france = merge_replacements(&rf.replace, Some(&rf.job[1].replace), "France");
+        assert_eq!(france, vec![
+            ("[country]".to_string(), "France (FR)".to_string()),
+            ("[wave]".to_string(), "Wave 3".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn test_merge_replacements_drops_empty_find() {
+        let mut global = HashMap::new();
+        global.insert(String::new(), "x".to_string());
+        global.insert("[a]".to_string(), "b".to_string());
+        assert_eq!(merge_replacements(&global, None, "J"), vec![("[a]".to_string(), "b".to_string())]);
+    }
+
+    #[test]
+    fn test_parse_legacy_detailed_with_replace() {
+        let toml_str = r#"
+[replace]
+"[country]" = "{name}"
+[jobs."template.pptx"]
+us = "data/us.xlsx"
+mx = { data = "data/mx.xlsx", replace = { "[country]" = "Mexico" } }
+"#;
+        let rf: RunFile = toml::from_str(toml_str).unwrap();
+        let jobs = rf.jobs.as_ref().unwrap().get("template.pptx").unwrap();
+        assert!(jobs["us"].replace_map().is_none());
+        assert_eq!(jobs["mx"].replace_map().unwrap()["[country]"], "Mexico");
+        assert_eq!(merge_replacements(&rf.replace, jobs["us"].replace_map(), "us"),
+            vec![("[country]".to_string(), "us".to_string())]);
+        assert_eq!(merge_replacements(&rf.replace, jobs["mx"].replace_map(), "mx"),
+            vec![("[country]".to_string(), "Mexico".to_string())]);
     }
 
     // --- Legacy format tests ---

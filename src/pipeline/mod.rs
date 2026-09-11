@@ -6,12 +6,15 @@
 //! 3. deltas   — Swap delta indicator arrows based on sign
 //! 4. coloring — Apply sign-based color coding (_ccst shapes)
 //! 5. charts   — Update chart data links
+//! 6. replace  — Replace literal text tokens (`-r FIND=VALUE`, runfile `[replace]`),
+//!    silently skipped when no replacements are given
 
 pub mod chart_updater;
 pub mod color_coder;
 pub mod delta_updater;
 pub mod linker;
 pub mod table_updater;
+pub mod text_replacer;
 pub mod verbose;
 
 use std::time::{Duration, Instant};
@@ -44,6 +47,7 @@ pub struct PipelineResults {
     pub deltas_updated: usize,
     pub tables_colored: usize,
     pub charts_updated: usize,
+    pub texts_replaced: usize,
 }
 
 impl PipelineResults {
@@ -133,6 +137,7 @@ pub fn run_pipeline(
     quiet: bool,
     verbose: bool,
     skip_chart_refresh: bool,
+    replacements: &[(String, String)],
 ) -> OaResult<PipelineResults> {
     verbose::set_verbose(verbose);
 
@@ -164,6 +169,13 @@ pub fn run_pipeline(
     if active_steps.iter().any(|s| s == "charts") {
         run_step!(results, quiet, "Charts", charts_updated,
             chart_updater::update_charts(inventory, excel_path, skip_chart_refresh)?);
+    }
+
+    // Last, so tokens inside freshly written table cells are covered too.
+    // Nothing to replace → no step line at all (keeps existing output unchanged).
+    if active_steps.iter().any(|s| s == "replace") && !replacements.is_empty() {
+        run_step!(results, quiet, "Replace", texts_replaced,
+            text_replacer::replace_text(presentation, replacements)?);
     }
 
     Ok(results)
