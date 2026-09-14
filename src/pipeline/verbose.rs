@@ -85,6 +85,26 @@ pub fn check_detail(slide: i32, check_type: &str, shape: &str, passed: bool, inf
         info);
 }
 
+/// Print a verbose check line with a yellow ⚠ — an observation, not a pass or a failure.
+///
+/// Format: `      Slide 15 │ pair  │ globalnet_g              ⚠ OLE has no delt_/table partner …`
+pub fn check_detail_warn(slide: i32, check_type: &str, shape: &str, info: &str) {
+    if !is_verbose() {
+        return;
+    }
+    let s = Style::new().dim();
+    let s_warn = Style::new().yellow();
+    println!("      {} {:>2} {} {:<5} {} {:<24} {} {}",
+        s.apply_to("Slide"),
+        s.apply_to(slide),
+        s.apply_to("│"),
+        s.apply_to(check_type),
+        s.apply_to("│"),
+        s.apply_to(shape),
+        s_warn.apply_to("⚠"),
+        s_warn.apply_to(info));
+}
+
 /// Print a chart series mismatch continuation line (no slide/chart prefix).
 ///
 /// Format: `           ╰ 'Series1'  3/4 differ   .28→.26  .47→.56  ...`

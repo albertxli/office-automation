@@ -43,14 +43,21 @@ pub struct CheckResult {
     pub chart_count: usize,
     pub chart_series_checked: usize,
     pub chart_mismatches: Vec<Mismatch>,
+    /// Special shapes (delt_/ntbl_/htmp_/trns_) whose pairing with an OLE object was checked.
+    pub pair_checked: usize,
+    /// Special shapes with NO OLE partner on their slide — naming errors (GOTCHA #49).
+    pub pair_mismatches: Vec<Mismatch>,
+    /// OLE objects driving neither a table nor a delta — listed, never a failure.
+    pub unpaired_oles: usize,
 }
 
 impl CheckResult {
     pub fn total_checked(&self) -> usize {
-        self.tbl_checked + self.delt_checked + self.chart_series_checked
+        self.tbl_checked + self.delt_checked + self.chart_series_checked + self.pair_checked
     }
     pub fn total_mismatches(&self) -> usize {
         self.tbl_mismatches.len() + self.delt_mismatches.len() + self.chart_mismatches.len()
+            + self.pair_mismatches.len()
     }
     pub fn passed(&self) -> bool {
         self.total_mismatches() == 0
@@ -163,6 +170,9 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config, ver
 
     let mut result = CheckResult::default();
 
+    // Naming first: an unpaired delt_/table shape explains every later "missing" result
+    check_pairs(&inventory, &mut result);
+
     // Check tables
     let sp = if !verbose { Some(make_check_spinner("Tables")) } else { None };
     check_tables(&inventory, &mut excel_app, &excel_str, config, &mut result);
@@ -178,9 +188,11 @@ pub fn run_check(pptx_path: &str, excel_path: Option<&str>, config: &Config, ver
 
     // Summary table (always shown — in verbose mode it's the only summary)
     println!();
+    print_check_row("Pairs",result.pair_checked, None, result.pair_mismatches.len());
     print_check_row("Tables", result.tbl_checked, None, result.tbl_mismatches.len());
     print_check_row("Deltas", result.delt_checked, None, result.delt_mismatches.len());
     print_check_row("Charts", result.chart_count, Some(result.chart_series_checked), result.chart_mismatches.len());
+    print_unpaired_ole_note(result.unpaired_oles, verbose);
 
     // Cleanup
     drop(inventory);
@@ -271,6 +283,8 @@ pub fn run_check_with_session(
 
     let mut result = CheckResult::default();
 
+    check_pairs(&inventory, &mut result);
+
     // Check tables
     let sp = if !verbose { Some(make_check_spinner("Tables")) } else { None };
     check_tables(&inventory, &mut session.excel_app, &excel_str, config, &mut result);
@@ -286,9 +300,11 @@ pub fn run_check_with_session(
 
     // Per-file summary table
     println!();
+    print_check_row("Pairs",result.pair_checked, None, result.pair_mismatches.len());
     print_check_row("Tables", result.tbl_checked, None, result.tbl_mismatches.len());
     print_check_row("Deltas", result.delt_checked, None, result.delt_mismatches.len());
     print_check_row("Charts", result.chart_count, Some(result.chart_series_checked), result.chart_mismatches.len());
+    print_unpaired_ole_note(result.unpaired_oles, verbose);
 
     // Per-file completion line
     let elapsed = overall_start.elapsed().as_secs_f64();
@@ -642,6 +658,51 @@ fn check_tables(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path
 /// Validate delta arrows: the shape's trailing `_pos/_neg/_none` must match the sign of
 /// the linked Excel cell. Works for every template set (`delt_`, `delt2_`, ...) because
 /// set recognition lives in the inventory (`matcher::delta_set`) and only the suffix is read here.
+/// Naming check (GOTCHA #49): every delt_/ntbl_/htmp_/trns_ shape must have an OLE partner
+/// on its slide. Unpaired ones are mismatches with a "closest OLE name" hint. OLE objects
+/// without a table/delta are only counted (a standalone linked picture is legitimate).
+fn check_pairs(inventory: &SlideInventory, result: &mut CheckResult) {
+    result.pair_checked = inventory.tables.len() + inventory.delts.len()
+        + inventory.unpaired_tables.len() + inventory.unpaired_delts.len();
+    result.unpaired_oles = inventory.unpaired_oles.len();
+
+    let s_dim = Style::new().dim();
+    for (slide, name, hint) in inventory.unpaired_special_shapes() {
+        let hint_txt = match &hint {
+            Some(h) => format!(" (closest OLE name: {h})"),
+            None => String::new(),
+        };
+        result.pair_mismatches.push(Mismatch {
+            slide,
+            shape: name.clone(),
+            category: "pair".into(),
+            detail: format!("no OLE object matches on this slide{hint_txt}"),
+        });
+        crate::pipeline::verbose::check_detail(
+            slide, "pair", &name, false,
+            &format!("no OLE object matches on this slide{}", s_dim.apply_to(&hint_txt)));
+    }
+    // Standalone OLE objects: yellow ⚠, never red — fine unless someone forgot the partner shape
+    for ole in &inventory.unpaired_oles {
+        crate::pipeline::verbose::check_detail_warn(
+            ole.slide_index, "pair", &ole.name,
+            "OLE has no delt_/table partner (fine if standalone — add one if you forgot)");
+    }
+}
+
+/// Yellow note under the summary when OLE objects without a partner exist (not a failure).
+fn print_unpaired_ole_note(count: usize, verbose: bool) {
+    if count == 0 { return; }
+    let s_warn = Style::new().yellow();
+    let s_dim = Style::new().dim();
+    let tail = if verbose { "" } else { " — run with -v to list them" };
+    println!("  {} {}{}",
+        s_warn.apply_to("⚠"),
+        s_warn.apply_to(format!("{count} OLE object{} without a table or delta partner",
+            if count == 1 { "" } else { "s" })),
+        s_dim.apply_to(format!(" (not a failure){tail}")));
+}
+
 fn check_deltas(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path: &str, config: &Config, result: &mut CheckResult) {
     let mut workbooks = match excel_app.get("Workbooks").and_then(|v| v.as_dispatch()).map(Dispatch::new) {
         Ok(wb) => wb, Err(_) => return,
@@ -650,10 +711,11 @@ fn check_deltas(inventory: &SlideInventory, excel_app: &mut Dispatch, excel_path
         if ole_ref.slide_index <= config.delta.template_slide { continue; }
         let key = (ole_ref.slide_index, ole_ref.name.clone());
         let delt_ref = match inventory.delts.get(&key) { Some(d) => d, None => continue };
+        // A paired delta without a sign suffix was never updated — report it, don't skip it
         let actual_sign = if delt_ref.name.ends_with("_pos") { "pos" }
             else if delt_ref.name.ends_with("_neg") { "neg" }
             else if delt_ref.name.ends_with("_none") { "none" }
-            else { continue };
+            else { "(none — never updated)" };
         let mut ole_shape = ole_ref.dispatch.clone();
         let source_full = match ole_shape.nav("LinkFormat").and_then(|mut lf| lf.get("SourceFullName")).and_then(|v| v.as_string()) {
             Ok(s) => s, Err(_) => continue,

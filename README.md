@@ -69,7 +69,7 @@ oa find template.pptx -t "[country]"
 |---------|-------------|
 | `oa update` | Run the update pipeline on PPTX files |
 | `oa run` | Execute a TOML runfile for batch processing |
-| `oa check` | Validate PPT values against Excel source |
+| `oa check` | Validate PPT values against Excel source, plus shape naming (every `delt_`/table shape needs an OLE partner) |
 | `oa info` | Inspect a PPTX file (read-only) |
 | `oa find` | Search text inside a PPTX (ZIP-level, no Office needed) |
 | `oa diff` | Compare two PPTX files side by side |
@@ -153,6 +153,13 @@ The OLE name and the `_pos/_neg/_none` suffix work exactly as for `delt_`, e.g.
 `delt2_Rev_DE_pos`. If a set's templates are missing, that set is skipped with a
 warning and other sets still update. `oa info` lists every set found and its templates;
 `oa check` validates all sets.
+
+A delta or table shape pairs with the OLE object on the **same slide** whose name it contains as
+a whole word (`delt2_globalnet_f` ↔ `globalnet_f`). A typo on either side (`globalnet_g`) leaves
+the shape untouched, so `oa update` warns about every unpaired `delt_`/`ntbl_`/`htmp_`/`trns_`
+shape (`Slide 15 │ delt2_globalnet_f · no OLE object matches on this slide (closest OLE name:
+globalnet_g) — not updated`), `oa check` fails them in a **Pairs** row, and `oa info` lists them.
+OLE objects that drive no table or delta are only counted: a standalone linked picture is fine.
 
 ### Delta thresholds
 

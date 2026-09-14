@@ -207,6 +207,20 @@ pub fn run_info(pptx_path: &str, verbose: bool) -> OaResult<()> {
         info_row_status(name, *found);
     }
 
+    // Pairing (GOTCHA #49): special shapes that no OLE object on their slide matches
+    println!();
+    println!("  {}", s_dim.apply_to("Pairing"));
+    let unpaired = inventory.unpaired_special_shapes();
+    info_row_flag("delt_/table shapes without OLE partner", unpaired.len(), unpaired.is_empty());
+    for (slide, name, hint) in &unpaired {
+        let s_red = Style::new().red();
+        let hint_txt = hint.as_deref().map(|h| format!("closest OLE name: {h}")).unwrap_or_default();
+        println!("      {} {:>2} {} {:<24} {}",
+            s_dim.apply_to("Slide"), s_dim.apply_to(slide), s_dim.apply_to("│"),
+            s_red.apply_to(name), s_dim.apply_to(hint_txt));
+    }
+    info_row_warn("OLE objects without partner (standalone?)", inventory.unpaired_oles.len());
+
     // Per-slide breakdown (verbose only)
     if verbose && !per_slide.is_empty() {
         print_per_slide_breakdown(&per_slide, slide_count);
@@ -334,6 +348,35 @@ fn info_row(label: &str, count: usize, indent: bool) {
 }
 
 /// Print a dot-leader row with ✓/✗ status instead of a number.
+/// Count row with a pass/fail mark: green ✓ when `ok`, red ✗ otherwise.
+fn info_row_flag(label: &str, count: usize, ok: bool) {
+    let s_dim = Style::new().dim();
+    let s_count = if ok { Style::new().green() } else { Style::new().red().bold() };
+    let prefix = "  ";
+    let target_col: usize = 48;
+    let display_len = prefix.chars().count() + label.chars().count() + 1;
+    let leader_len = target_col.saturating_sub(display_len);
+    let padded = format!("{prefix}{label} {}", "·".repeat(leader_len));
+    let mark = if ok { Style::new().green().apply_to("✓") } else { Style::new().red().apply_to("✗") };
+    println!("{} {:>4} {}", s_dim.apply_to(&padded), s_count.apply_to(count), mark);
+}
+
+/// Count row with a yellow ⚠ when non-zero: worth a look, not an error.
+fn info_row_warn(label: &str, count: usize) {
+    let s_dim = Style::new().dim();
+    let prefix = "  ";
+    let target_col: usize = 48;
+    let display_len = prefix.chars().count() + label.chars().count() + 1;
+    let leader_len = target_col.saturating_sub(display_len);
+    let padded = format!("{prefix}{label} {}", "·".repeat(leader_len));
+    if count == 0 {
+        println!("{} {:>4} {}", s_dim.apply_to(&padded), s_dim.apply_to("·"), Style::new().green().apply_to("✓"));
+    } else {
+        let s_warn = Style::new().yellow();
+        println!("{} {:>4} {}", s_dim.apply_to(&padded), s_warn.apply_to(count), s_warn.apply_to("⚠"));
+    }
+}
+
 fn info_row_status(label: &str, found: bool) {
     let s_dim = Style::new().dim();
     let prefix = "    ╰ ";

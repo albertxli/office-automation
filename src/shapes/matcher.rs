@@ -150,6 +150,72 @@ pub fn delta_set(name: &str) -> Option<u32> {
     None
 }
 
+/// The OLE-facing token of a special shape name: type prefix and sign suffix removed.
+/// `delt2_globalnet_f_pos` → `globalnet_f`, `ntbl_Object_edu` → `Object_edu`, `htmp_x` → `x`.
+pub fn special_token(name: &str) -> &str {
+    let mut rest = name;
+    if let Some(pos) = rest.find("delt") {
+        let after = &rest[pos + 4..];
+        let digits = after.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if after[digits..].starts_with('_') {
+            rest = &after[digits + 1..];
+        }
+    } else {
+        for prefix in ["ntbl_", "htmp_", "trns_"] {
+            if let Some(r) = rest.strip_prefix(prefix) {
+                rest = r;
+                break;
+            }
+        }
+    }
+    strip_sign_suffix(rest)
+}
+
+/// Levenshtein distance over chars (small inputs only — shape names).
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The candidate closest to `target` when it is plausibly a typo of it: edit distance ≤ 2
+/// and no more than half the target's length. Ties → longest shared prefix, then first.
+/// Used for hints like `delt2_globalnet_f … (closest: globalnet_g)` (GOTCHA #49).
+pub fn closest_name<'a>(target: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let target_len = target.chars().count();
+    if target.is_empty() || target_len == 0 {
+        return None;
+    }
+    let max_d = 2usize.min((target_len / 2).max(1));
+    let common_prefix = |c: &str| target.chars().zip(c.chars()).take_while(|(x, y)| x == y).count();
+    let mut best: Option<(&'a str, usize, usize)> = None; // (name, distance, shared prefix)
+    for &c in candidates {
+        let d = levenshtein(target, c);
+        if d > max_d {
+            continue;
+        }
+        let p = common_prefix(c);
+        let better = match best {
+            None => true,
+            Some((_, bd, bp)) => d < bd || (d == bd && p > bp),
+        };
+        if better {
+            best = Some((c, d, p));
+        }
+    }
+    best.map(|(c, _, _)| c)
+}
+
 /// Derive the template shape name for a given delta set.
 ///
 /// - Set 1 returns `base` unchanged (the configured `tmpl_delta_*` name).
@@ -169,6 +235,40 @@ pub fn template_name_for_set(base: &str, set: u32, sign: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── GOTCHA #49: unpaired special shapes ────────────────
+
+    #[test]
+    fn test_special_token() {
+        assert_eq!(special_token("delt2_globalnet_f"), "globalnet_f");
+        assert_eq!(special_token("delt2_globalnet_f_pos"), "globalnet_f");
+        assert_eq!(special_token("delt_marketnet_none"), "marketnet");
+        assert_eq!(special_token("delt12_Rev_DE_neg"), "Rev_DE");
+        assert_eq!(special_token("ntbl_Object_edu"), "Object_edu");
+        assert_eq!(special_token("htmp_Heat_1"), "Heat_1");
+        assert_eq!(special_token("trns_T"), "T");
+        assert_eq!(special_token("Object_plain"), "Object_plain");
+    }
+
+    #[test]
+    fn test_levenshtein() {
+        assert_eq!(levenshtein("globalnet_f", "globalnet_g"), 1);
+        assert_eq!(levenshtein("abc", "abc"), 0);
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn test_closest_name_typo_hint() {
+        let oles = ["globalnet_a", "globalnet_b", "globalnet_c", "globalnet_d", "globalnet_e", "globalnet_g"];
+        // all are distance 1 from globalnet_f — tie broken by shared prefix, then first
+        assert_eq!(closest_name("globalnet_f", &oles), Some("globalnet_a"));
+        assert_eq!(closest_name("globalnet_f", &["marketnet_f", "globalnet_g"]), Some("globalnet_g"));
+        assert_eq!(closest_name("globalnet_f", &["Object_edu", "Object_age"]), None, "nothing near");
+        assert_eq!(closest_name("globalnet_f", &[]), None);
+        assert_eq!(closest_name("ab", &["xy"]), None, "short names need distance ≤ 1");
+        assert_eq!(closest_name("ab", &["ac"]), Some("ac"));
+    }
 
     // --- classify_shape_name tests ---
 

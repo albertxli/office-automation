@@ -243,6 +243,19 @@ fn process_single_file(
     let inventory = build_inventory(&mut presentation);
     pverbose::note(&format!("Build inventory ············ {:.1}s", t_inv.elapsed().as_secs_f64()));
 
+    // GOTCHA #49: a delt_/table shape with no OLE partner is a naming error — it will not be
+    // updated, so say so loudly (always visible, counted on the completion line).
+    for (slide, name, hint) in inventory.unpaired_special_shapes() {
+        let hint_txt = hint.map(|h| format!(" (closest OLE name: {h})")).unwrap_or_default();
+        pverbose::warn(&format!(
+            "Slide {slide:>2} │ {name} · no OLE object matches on this slide{hint_txt} — not updated"));
+    }
+    if !inventory.unpaired_oles.is_empty() {
+        pverbose::note(&format!(
+            "{} OLE object(s) drive no table or delta (fine for standalone pictures; `oa check -v` lists them)",
+            inventory.unpaired_oles.len()));
+    }
+
     // Run pipeline
     let pipeline_result = pipeline::run_pipeline(
         &inventory,

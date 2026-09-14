@@ -267,10 +267,11 @@ oa check <FILE> [OPTIONS]
 | `-v, --verbose` | Show per-cell comparison details |
 
 **What it checks:**
+- **Pairs**: Every `delt_`/`ntbl_`/`htmp_`/`trns_` shape must have an OLE object on its slide whose name it contains as a whole word; unpaired ones fail with a closest-name hint (`delt2_globalnet_f: no OLE object matches on this slide (closest OLE name: globalnet_g)`). OLE objects that drive no table or delta are only counted (listed with `-v`, yellow ⚠ — fine if standalone)
 - **Tables**: Every cell in every linked table compared to its Excel source
 - **Transposed tables**: Handles row/col swap correctly
 - **_ccst tables**: Applies the same transform (prefix, symbol removal) before comparing
-- **Deltas**: Verifies shape sign suffix (_pos/_neg/_none) matches Excel value
+- **Deltas**: Verifies shape sign suffix (_pos/_neg/_none) matches Excel value; a paired delta that still has no suffix is reported as never updated
 - **Charts**: Link targets, series counts, series values, category labels and series names (cached vs Excel)
 
 **Examples:**
