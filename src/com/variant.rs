@@ -202,6 +202,48 @@ impl Variant {
         Err(OaError::Other(format!("Unsupported SAFEARRAY element type: VT={elem_vt}")))
     }
 
+    /// Read every cell of a `Range.Value2` result as a typed `CellValue`, row-major
+    /// (GOTCHA #48): strings stay strings, blanks/errors are `Empty`, numbers are numbers.
+    pub fn as_flat_cell_vec(&self) -> OaResult<Vec<CellValue>> {
+        if !self.is_array() {
+            return Ok(vec![variant_to_cell(&self.0)]);
+        }
+        let elem_vt = self.vt() & 0x0FFF;
+        if elem_vt == VT_R8 {
+            return Ok(self.as_f64_array()?.into_iter().map(CellValue::F64).collect());
+        }
+        if elem_vt == VT_VARIANT {
+            unsafe {
+                let psa = self.safearray_ptr()?;
+                let dims = SafeArrayGetDim(psa);
+                let mut out = Vec::new();
+                match dims {
+                    1 => {
+                        let lb = SafeArrayGetLBound(psa, 1).map_err(OaError::Com)?;
+                        let ub = SafeArrayGetUBound(psa, 1).map_err(OaError::Com)?;
+                        for i in lb..=ub {
+                            out.push(variant_to_cell(&self.get_variant_element(psa, &[i])?));
+                        }
+                    }
+                    2 => {
+                        let row_lb = SafeArrayGetLBound(psa, 1).map_err(OaError::Com)?;
+                        let row_ub = SafeArrayGetUBound(psa, 1).map_err(OaError::Com)?;
+                        let col_lb = SafeArrayGetLBound(psa, 2).map_err(OaError::Com)?;
+                        let col_ub = SafeArrayGetUBound(psa, 2).map_err(OaError::Com)?;
+                        for r in row_lb..=row_ub {
+                            for c in col_lb..=col_ub {
+                                out.push(variant_to_cell(&self.get_variant_element(psa, &[r, c])?));
+                            }
+                        }
+                    }
+                    _ => return Err(OaError::Other(format!("Unsupported {dims}D SAFEARRAY"))),
+                }
+                return Ok(out);
+            }
+        }
+        Err(OaError::Other(format!("Unsupported SAFEARRAY element type: VT={elem_vt}")))
+    }
+
     /// Read 1D SAFEARRAY of VARIANTs, preserving blanks as `None`.
     unsafe fn read_variant_array_1d_opt(&self, psa: *const SAFEARRAY) -> OaResult<Vec<Option<f64>>> {
         let lb = unsafe { SafeArrayGetLBound(psa, 1).map_err(OaError::Com)? };
@@ -343,6 +385,25 @@ fn variant_to_opt_f64(v: &VARIANT) -> Option<f64> {
         return Some(val as f64);
     }
     None
+}
+
+/// Typed view of one cell VARIANT: text stays text, blank/null/error → `Empty`.
+fn variant_to_cell(v: &VARIANT) -> CellValue {
+    // SAFETY: reading the discriminant of the VARIANT union.
+    let vt = unsafe { v.Anonymous.Anonymous.vt.0 };
+    match vt {
+        VT_EMPTY_TAG | VT_NULL_TAG | VT_ERROR_TAG => CellValue::Empty,
+        VT_BSTR_TAG => CellValue::Str(BSTR::try_from(v).map(|b| b.to_string()).unwrap_or_default()),
+        _ => {
+            if let Ok(x) = f64::try_from(v) {
+                CellValue::F64(x)
+            } else if let Ok(i) = i32::try_from(v) {
+                CellValue::I32(i)
+            } else {
+                CellValue::Empty
+            }
+        }
+    }
 }
 
 /// Parse a cell's text as a number for chart data. `"12%"` → `0.12`, `""` → `None`.

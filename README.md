@@ -114,7 +114,7 @@ The update pipeline runs these steps in order:
 | **Tables** | Populate PPT table cells from Excel ranges |
 | **Deltas** | Swap delta indicator arrows based on value sign, with optional dead-band thresholds (see below) |
 | **Coloring** | Apply sign-based color coding to _ccst tables |
-| **Charts** | Rebuild each chart's data cache from Excel and re-point links; blank cells draw nothing, a real 0 draws a zero bar; series formulas that name a workbook (`[book.xlsx]Sheet!Range`) are normalised and reported as a warning |
+| **Charts** | Rebuild everything a linked chart references — values, category labels, series names, scatter/bubble data — the same result as PowerPoint's own refresh, with the link left on manual update; blank cells draw nothing, a real 0 draws a zero bar; series formulas that name a workbook (`[book.xlsx]Sheet!Range`) are normalised and reported as a warning |
 | **Replace** | Replace literal text tokens (`-r [country]=Japan`) across slides, masters and layouts; only runs when replacements are given (see below) |
 
 Steps can be selectively run or skipped:

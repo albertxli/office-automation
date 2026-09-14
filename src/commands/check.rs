@@ -19,7 +19,7 @@ use crate::pipeline::delta_updater::{determine_sign, sign_with_threshold};
 use crate::pipeline::table_updater::open_or_get_workbook;
 
 /// Series data: Vec of (range_ref, cached_values) per chart.
-use crate::zip_ops::chart_data::{ChartSeriesData, ChartValue};
+use crate::zip_ops::chart_data::{ChartSeriesData, ChartValue, SeriesLabels};
 use crate::zip_ops::slide_map::{get_slide_order, read_rels_map, read_zip_entry};
 use crate::shapes::inventory::{build_inventory, SlideInventory};
 use crate::shapes::matcher::TableType;
@@ -737,6 +737,7 @@ fn check_charts(
 
     // Pre-read chart cached values from ZIP — avoids COM Series.Values calls
     let chart_cache_map = build_chart_cache_map(pptx_path).unwrap_or_default();
+    let chart_label_map = build_chart_label_map(pptx_path).unwrap_or_default();
 
     let excel_filename = std::path::Path::new(excel_path)
         .file_name()
@@ -845,8 +846,9 @@ fn check_charts(
             // Check 3: series values match (always attempt if we have refs)
             if let Some(series_refs) = refs {
                 let cached = chart_cache_map.get(&key).cloned().unwrap_or_default();
+                let labels = chart_label_map.get(&key).cloned().unwrap_or_default();
                 let value_ok = check_chart_series_values(
-                    &cached, &mut workbooks, excel_path, series_refs,
+                    &cached, &labels, &mut workbooks, excel_path, series_refs,
                     chart_ref, series_count, result,
                 );
                 if value_ok && chart_ok {
@@ -872,8 +874,10 @@ fn check_charts(
 /// Compare series values between PPT and Excel for one chart.
 ///
 /// Returns true if all series match, false if any mismatch found.
+#[allow(clippy::too_many_arguments)]
 fn check_chart_series_values(
     ppt_cached: &[(String, Vec<ChartValue>)],  // ZIP-cached values (ref, values) per series; None = no point
+    ppt_labels: &[SeriesLabels],               // ZIP-cached categories + series names per series (GOTCHA #48)
     workbooks: &mut Dispatch,
     excel_path: &str,
     series_refs: &[String],
@@ -936,21 +940,111 @@ fn check_chart_series_values(
         }
     }
 
-    if !mismatches.is_empty() {
+    // --- Labels: categories and series names must match Excel too (GOTCHA #48) ---
+    struct LabelMismatch {
+        name: String,
+        diff_count: usize,
+        total: usize,
+        pairs: Vec<(Option<String>, Option<String>)>,
+        has_more: bool,
+    }
+    let mut label_mismatches: Vec<LabelMismatch> = Vec::new();
+    let blank_eq = |a: &Option<String>, b: &Option<String>| -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(x), Some(y)) => x == y,
+            (Some(x), None) | (None, Some(x)) => x.is_empty(),
+        }
+    };
+    for (i, lab) in ppt_labels.iter().enumerate() {
+        if lab.multi_level {
+            continue; // rebuilt by PowerPoint, not comparable cell by cell
+        }
+        let series_name = crate::pipeline::verbose::truncate_middle(&format!("Series {}", i + 1));
+
+        if let Some(cat_ref) = &lab.cat_ref
+            && !lab.cat.is_empty()
+            && let Ok(excel) = read_chart_texts(&mut wb, cat_ref)
+        {
+            let total = lab.cat.len().max(excel.len());
+            let mut pairs = Vec::new();
+            let mut diff_count = 0;
+            for idx in 0..total {
+                let p = lab.cat.get(idx).cloned().flatten();
+                let e = excel.get(idx).cloned().flatten();
+                if !blank_eq(&p, &e) {
+                    diff_count += 1;
+                    if pairs.len() < 4 { pairs.push((p, e)); }
+                }
+            }
+            if diff_count > 0 {
+                result.chart_mismatches.push(Mismatch {
+                    slide: chart_ref.slide_index,
+                    shape: chart_ref.name.clone(),
+                    category: "chart".into(),
+                    detail: format!("'{series_name}' {diff_count}/{total} category labels differ"),
+                });
+                label_mismatches.push(LabelMismatch { name: series_name.clone(), diff_count, total, has_more: diff_count > pairs.len(), pairs });
+            }
+        }
+
+        // Series name: one cached point per referenced cell (multi-cell names are common)
+        if let Some(tx_ref) = &lab.tx_ref
+            && !lab.tx.is_empty()
+            && let Ok(excel) = read_chart_texts(&mut wb, tx_ref)
+        {
+            let total = lab.tx.len().max(excel.len());
+            let mut pairs = Vec::new();
+            let mut diff_count = 0;
+            for idx in 0..total {
+                let p = lab.tx.get(idx).cloned().flatten();
+                let e = excel.get(idx).cloned().flatten();
+                if !blank_eq(&p, &e) {
+                    diff_count += 1;
+                    if pairs.len() < 4 { pairs.push((p, e)); }
+                }
+            }
+            if diff_count > 0 {
+                result.chart_mismatches.push(Mismatch {
+                    slide: chart_ref.slide_index,
+                    shape: chart_ref.name.clone(),
+                    category: "chart".into(),
+                    detail: format!("'{series_name}' name differs ({diff_count}/{total} cells)"),
+                });
+                label_mismatches.push(LabelMismatch {
+                    name: format!("{series_name} name"), diff_count, total,
+                    has_more: diff_count > pairs.len(), pairs,
+                });
+            }
+        }
+    }
+
+    if !mismatches.is_empty() || !label_mismatches.is_empty() {
         // Print ✗ parent line before ╰ continuation lines
         let total_diffs: usize = mismatches.iter().map(|m| m.diff_count).sum();
+        let total_label_diffs: usize = label_mismatches.iter().map(|m| m.diff_count).sum();
+        let summary = match (total_diffs, total_label_diffs) {
+            (v, 0) => format!("{v} values differ ({series_count} series)"),
+            (0, l) => format!("{l} labels differ ({series_count} series)"),
+            (v, l) => format!("{v} values, {l} labels differ ({series_count} series)"),
+        };
         crate::pipeline::verbose::check_detail(
-            chart_ref.slide_index, "chart", &chart_ref.name, false,
-            &format!("{total_diffs} values differ ({series_count} series)"));
+            chart_ref.slide_index, "chart", &chart_ref.name, false, &summary);
 
-        let max_name_len = mismatches.iter().map(|m| m.name.len()).max().unwrap_or(0);
+        let max_name_len = mismatches.iter().map(|m| m.name.len())
+            .chain(label_mismatches.iter().map(|m| m.name.len()))
+            .max().unwrap_or(0);
         for m in &mismatches {
             crate::pipeline::verbose::check_chart_series_diff(
                 &m.name, max_name_len, m.diff_count, m.total, &m.pairs, m.has_more);
         }
+        for m in &label_mismatches {
+            crate::pipeline::verbose::check_chart_label_diff(
+                &m.name, max_name_len, m.diff_count, m.total, &m.pairs, m.has_more);
+        }
     }
 
-    mismatches.is_empty()
+    mismatches.is_empty() && label_mismatches.is_empty()
 }
 
 /// Collect first N mismatched (ppt, excel) value pairs for compact display.
@@ -990,26 +1084,24 @@ fn read_chart_range(wb: &mut Dispatch, range_ref: &str) -> OaResult<Vec<ChartVal
 
     // Split on comma for non-contiguous ranges (GOTCHA #20)
     for sub_range in ref_str.split(',') {
-        let sub = sub_range.trim().to_string();
-        let (sheet_name, range_addr) = if let Some(pos) = sub.find('!') {
-            (sub[..pos].to_string(), sub[pos + 1..].to_string())
-        } else {
-            ("Tables".to_string(), sub)
-        };
-
-        let val = wb.get("Worksheets")
-            .and_then(|v| v.as_dispatch())
-            .and_then(|d| Dispatch::new(d).call("Item", &[Variant::from(sheet_name.as_str())]))
-            .and_then(|v| v.as_dispatch())
-            .and_then(|d| Dispatch::new(d).call("Range", &[Variant::from(range_addr.as_str())]))
-            .and_then(|v| v.as_dispatch())
-            .and_then(|d| Dispatch::new(d).get("Value2"))?;
-
+        let mut range = crate::office::excel_data::range_dispatch(wb, sub_range.trim())?;
         // Scalar or SAFEARRAY; blank → None, real 0 → Some(0.0)
-        values.extend(val.as_flat_opt_f64_vec()?);
+        values.extend(crate::office::excel_data::read_range_numbers(&mut range)?);
     }
 
     Ok(values)
+}
+
+/// Read Excel display text for a chart label reference (categories / series name) —
+/// the same reader the updater uses to rebuild `strCache` (GOTCHA #48). Blank → `None`.
+fn read_chart_texts(wb: &mut Dispatch, range_ref: &str) -> OaResult<Vec<Option<String>>> {
+    let mut texts = Vec::new();
+    let ref_str = crate::zip_ops::chart_data::normalize_range_ref(range_ref);
+    for sub_range in ref_str.split(',') {
+        let mut range = crate::office::excel_data::range_dispatch(wb, sub_range.trim())?;
+        texts.extend(crate::office::excel_data::read_range_texts(&mut range)?);
+    }
+    Ok(texts)
 }
 
 /// Build chart reference map from PPTX ZIP.
@@ -1071,9 +1163,37 @@ fn build_chart_ref_map(pptx_path: &std::path::Path) -> Result<HashMap<(i32, usiz
 /// Returns: {(slide_num, chart_position) → Vec<(range_ref, cached_values)>}
 /// This reads <c:numCache> values directly from the ZIP — no COM needed.
 fn build_chart_cache_map(pptx_path: &std::path::Path) -> Result<HashMap<(i32, usize), ChartSeriesData>, String> {
+    let mut result = HashMap::new();
+    for (key, xml) in linked_chart_xmls(pptx_path)? {
+        let cached = crate::zip_ops::chart_data::extract_cached_values(&xml);
+        if !cached.is_empty() {
+            result.insert(key, cached);
+        }
+    }
+    Ok(result)
+}
+
+/// Build chart CACHED LABELS map (categories + series names) from PPTX ZIP (GOTCHA #48).
+/// Returns: {(slide_num, chart_position) → per-series labels}
+fn build_chart_label_map(pptx_path: &std::path::Path) -> Result<HashMap<(i32, usize), Vec<SeriesLabels>>, String> {
+    let mut result = HashMap::new();
+    for (key, xml) in linked_chart_xmls(pptx_path)? {
+        let labels = crate::zip_ops::chart_data::extract_cached_labels(&xml);
+        if !labels.is_empty() {
+            result.insert(key, labels);
+        }
+    }
+    Ok(result)
+}
+
+/// `(slide_num, chart_position)` — how the COM inventory walks charts (GOTCHA #19).
+type ChartKey = (i32, usize);
+
+/// `(ChartKey, chart XML)` for every externally linked chart.
+fn linked_chart_xmls(pptx_path: &std::path::Path) -> Result<Vec<(ChartKey, String)>, String> {
     let file = std::fs::File::open(pptx_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-    let mut result: HashMap<(i32, usize), ChartSeriesData> = HashMap::new();
+    let mut result: Vec<(ChartKey, String)> = Vec::new();
 
     let slide_order = get_slide_order(&mut archive)?;
 
@@ -1100,10 +1220,7 @@ fn build_chart_cache_map(pptx_path: &std::path::Path) -> Result<HashMap<(i32, us
                 format!("ppt/charts/{}", chart_path.trim_start_matches("../charts/"))
             };
             if let Some(chart_xml) = read_zip_entry(&mut archive, &full_chart_path) {
-                let cached = crate::zip_ops::chart_data::extract_cached_values(&chart_xml);
-                if !cached.is_empty() {
-                    result.insert((slide_num, pos), cached);
-                }
+                result.push(((slide_num, pos), chart_xml));
             }
         }
     }

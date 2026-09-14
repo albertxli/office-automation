@@ -138,6 +138,7 @@ pub fn run_pipeline(
     verbose: bool,
     skip_chart_refresh: bool,
     replacements: &[(String, String)],
+    force_chart_refresh: &std::collections::HashSet<(i32, String)>,
 ) -> OaResult<PipelineResults> {
     verbose::set_verbose(verbose);
 
@@ -168,7 +169,7 @@ pub fn run_pipeline(
 
     if active_steps.iter().any(|s| s == "charts") {
         run_step!(results, quiet, "Charts", charts_updated,
-            chart_updater::update_charts(inventory, excel_path, skip_chart_refresh)?);
+            chart_updater::update_charts(inventory, excel_path, skip_chart_refresh, force_chart_refresh)?);
     }
 
     // Last, so tokens inside freshly written table cells are covered too.

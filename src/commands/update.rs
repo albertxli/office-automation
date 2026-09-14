@@ -186,6 +186,8 @@ fn process_single_file(
     // ZIP chart data pre-update: rewrite numCache values directly in chart XML.
     // This bypasses the slow LinkFormat.Update() COM call.
     let mut chart_data_ok = false;
+    // Charts the ZIP rewrite could not fully rebuild → PowerPoint refresh (GOTCHA #48)
+    let mut force_chart_refresh: std::collections::HashSet<(i32, String)> = std::collections::HashSet::new();
     if !dry_run {
         let chart_t = std::time::Instant::now();
         match zip_chart_preupdate(pptx_path, excel_path, &mut session.excel_app, quiet, verbose) {
@@ -194,6 +196,16 @@ fn process_single_file(
                 // COM Update() fallback for all charts in that case (slow but correct).
                 chart_data_ok = result.all_ranges_ok
                     && (result.charts_updated > 0 || result.series_updated == 0);
+                if !result.needs_refresh.is_empty() {
+                    let owners = crate::zip_ops::slide_map::chart_part_owners(pptx_path).unwrap_or_default();
+                    for part in &result.needs_refresh {
+                        match owners.get(part) {
+                            Some((slide, name)) => { force_chart_refresh.insert((*slide, name.clone())); }
+                            None => pverbose::warn(&format!(
+                                "{part}: multi-level categories or cell data labels, but the owning slide could not be resolved — labels may be stale")),
+                        }
+                    }
+                }
                 let chart_elapsed = chart_t.elapsed().as_secs_f64();
                 if verbose {
                     let fixed = if result.fixed.is_empty() {
@@ -202,8 +214,8 @@ fn process_single_file(
                         format!(", {} fixed", result.fixed.len())
                     };
                     pverbose::note(&format!(
-                        "Chart pre-update ··········· {} charts ({} series{fixed}) · {:.1}s",
-                        result.charts_updated, result.series_updated, chart_elapsed
+                        "Chart pre-update ··········· {} charts ({} series, {} labels{fixed}) · {:.1}s",
+                        result.charts_updated, result.series_updated, result.labels_updated, chart_elapsed
                     ));
                 }
             }
@@ -244,6 +256,7 @@ fn process_single_file(
         verbose,
         chart_data_ok,
         replacements,
+        &force_chart_refresh,
     );
 
     // Save (unless dry-run or pipeline failed)
@@ -361,14 +374,17 @@ fn pick_excel_file() -> OaResult<PathBuf> {
     }
 }
 
-/// ZIP chart data pre-update: scan chart ranges, read values from Excel, rewrite ZIP.
+/// ZIP chart data pre-update: scan chart references, read Excel, rewrite the ZIP.
 ///
-/// Opens the Excel workbook (via already-open Excel app), reads all chart range values
-/// in batch using Range.Value2 (SAFEARRAY), then rewrites the PPTX chart XML cache.
+/// Every series reference is rebuilt (GOTCHA #48): values via `Value2`, category labels
+/// and series names via display text. Charts with constructs the rewrite cannot handle
+/// (multi-level categories, data labels from cells) are returned in `needs_refresh` and
+/// refreshed by PowerPoint's `LinkFormat.Update()` instead.
 ///
 /// A range that cannot be read is reported with `verbose::warn` and skipped — it never
-/// aborts the pre-update for the other charts (GOTCHA #44). Charts whose `<c:f>` named a
-/// workbook explicitly are normalised and reported the same way.
+/// aborts the pre-update for the other charts (GOTCHA #44); the COM fallback then covers
+/// every chart for that run. Charts whose `<c:f>` named a workbook explicitly are
+/// normalised and reported the same way.
 fn zip_chart_preupdate(
     pptx_path: &Path,
     excel_path: &Path,
@@ -376,21 +392,18 @@ fn zip_chart_preupdate(
     _quiet: bool,
     _verbose: bool,
 ) -> Result<crate::zip_ops::chart_data::ChartDataResult, String> {
-    use crate::zip_ops::chart_data;
+    use crate::office::excel_data;
     use crate::pipeline::table_updater::open_or_get_workbook;
+    use crate::zip_ops::chart_data::{self, CacheValues, RangeKey, RefKind};
 
-    // Step 1: Scan chart XML for range references
-    let chart_ranges = chart_data::scan_chart_ranges(pptx_path)?;
-    if chart_ranges.is_empty() {
+    // Step 1: Scan chart XML for every series reference (tx / cat / val / …)
+    let scan = chart_data::scan_chart_ranges(pptx_path)?;
+    if scan.refs.is_empty() && scan.needs_com.is_empty() {
         return Ok(chart_data::ChartDataResult { all_ranges_ok: true, ..Default::default() });
     }
 
-    // Step 2: Collect unique range refs (normalised: no `$`, no `[workbook]`) and read
-    // values from Excel via COM
-    let unique_ranges = chart_data::collect_unique_ranges(&chart_ranges);
-    if unique_ranges.is_empty() {
-        return Ok(chart_data::ChartDataResult { all_ranges_ok: true, ..Default::default() });
-    }
+    // Step 2: Collect unique (range, kind) keys — normalised: no `$`, no `[workbook]`
+    let unique_ranges = chart_data::collect_unique_ranges(&scan.refs);
     let excel_name = excel_path.file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -402,30 +415,18 @@ fn zip_chart_preupdate(
     );
     let mut wb = open_or_get_workbook(&mut workbooks, &excel_str).map_err(|e| e.to_string())?;
 
-    // GOTCHA #43: Option<f64> — None = blank cell = no chart point.
-    let mut range_values: std::collections::HashMap<String, Vec<chart_data::ChartValue>> = std::collections::HashMap::new();
+    // GOTCHA #43: numbers are Option<f64> — None = blank cell = no chart point.
+    // GOTCHA #48: strings are Option<String> — display text, None = blank cell.
+    let mut range_values: std::collections::HashMap<RangeKey, CacheValues> = std::collections::HashMap::new();
     let mut all_ranges_ok = true;
 
-    for range_ref in &unique_ranges {
-        // Parse "Sheet!Range" format
-        let (sheet_name, range_addr) = if let Some(pos) = range_ref.find('!') {
-            (range_ref[..pos].to_string(), range_ref[pos + 1..].to_string())
-        } else {
-            ("Tables".to_string(), range_ref.clone())
-        };
-
-        // Read via Range.Value2 (SAFEARRAY batch — one COM call per range)
-        let read = wb.get("Worksheets")
-            .and_then(|v| v.as_dispatch())
-            .and_then(|d| Dispatch::new(d).call("Item", &[Variant::from(sheet_name.as_str())]))
-            .and_then(|v| v.as_dispatch())
-            .and_then(|d| Dispatch::new(d).call("Range", &[Variant::from(range_addr.as_str())]))
-            .and_then(|v| v.as_dispatch())
-            .and_then(|d| Dispatch::new(d).get("Value2"))
-            .and_then(|val| val.as_flat_opt_f64_vec());
-
+    for (range_ref, kind) in &unique_ranges {
+        let read = excel_data::range_dispatch(&mut wb, range_ref).and_then(|mut range| match kind {
+            RefKind::Num => excel_data::read_range_numbers(&mut range).map(CacheValues::Num),
+            RefKind::Str => excel_data::read_range_texts(&mut range).map(CacheValues::Str),
+        });
         match read {
-            Ok(values) => { range_values.insert(range_ref.clone(), values); }
+            Ok(values) => { range_values.insert((range_ref.clone(), *kind), values); }
             Err(e) => {
                 // One bad range must not abort the other charts (GOTCHA #44).
                 all_ranges_ok = false;
@@ -436,7 +437,7 @@ fn zip_chart_preupdate(
         }
     }
 
-    // Step 3: Rewrite chart XML cache (and normalise formulas) in the PPTX ZIP
+    // Step 3: Rewrite chart XML caches (and normalise formulas) in the PPTX ZIP
     let mut result = chart_data::update_chart_data(pptx_path, &range_values)?;
     result.all_ranges_ok = all_ranges_ok;
 

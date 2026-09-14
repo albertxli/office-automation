@@ -22,6 +22,7 @@ pub fn update_charts(
     inventory: &SlideInventory,
     excel_path: &str,
     skip_refresh: bool,
+    force_refresh: &std::collections::HashSet<(i32, String)>,
 ) -> OaResult<usize> {
     if inventory.charts.is_empty() {
         return Ok(0);
@@ -31,6 +32,10 @@ pub fn update_charts(
 
     for chart_ref in &inventory.charts {
         let mut shape = chart_ref.dispatch.clone();
+        // GOTCHA #48: charts the ZIP rewrite could not fully rebuild (multi-level
+        // categories, data labels from cells) get PowerPoint's own refresh.
+        let forced = force_refresh.contains(&(chart_ref.slide_index, chart_ref.name.clone()));
+        let skip_refresh = skip_refresh && !forced;
 
         let mut link_format = match shape.nav("LinkFormat") {
             Ok(lf) => lf,
@@ -72,6 +77,11 @@ pub fn update_charts(
             let _ = link_format.put("AutoUpdate", Variant::from(PpUpdateOption::Manual as i32));
             if refreshed {
                 updated += 1;
+                if forced {
+                    super::verbose::warn(&format!(
+                        "Slide {:>2} │ {} · multi-level categories or cell data labels — refreshed via PowerPoint (link stays manual)",
+                        chart_ref.slide_index, chart_ref.name));
+                }
                 super::verbose::detail(chart_ref.slide_index, &chart_ref.name, "linked + refreshed");
             } else {
                 super::verbose::detail(chart_ref.slide_index, &chart_ref.name, "refresh FAILED");

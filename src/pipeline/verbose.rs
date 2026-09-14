@@ -129,6 +129,47 @@ pub fn check_chart_series_diff(name: &str, name_pad: usize, diff_count: usize, t
     println!("{overflow}");
 }
 
+/// Print a chart LABEL mismatch continuation line (categories / series name, GOTCHA #48).
+///
+/// Format: `           ╰ 'Series 1' labels  5/5 differ   Outdoor Ads→Health Risks…  …`
+/// Same colouring as `check_chart_series_diff`; each text is middle-truncated to 18 chars.
+pub fn check_chart_label_diff(name: &str, name_pad: usize, diff_count: usize, total: usize, pairs: &[(Option<String>, Option<String>)], has_more: bool) {
+    if !is_verbose() {
+        return;
+    }
+    let s_dim = Style::new().dim();
+    let s_name = Style::new().yellow();
+    let s_ppt = Style::new().red();
+    let s_excel = Style::new().white().bold();
+
+    let short = |v: &Option<String>| -> String {
+        match v {
+            Some(s) if s.chars().count() > 18 => {
+                let cs: Vec<char> = s.chars().collect();
+                format!("{}…{}", cs[..9].iter().collect::<String>(), cs[cs.len() - 8..].iter().collect::<String>())
+            }
+            Some(s) => s.clone(),
+            None => "(blank)".to_string(),
+        }
+    };
+    let values = pairs.iter()
+        .map(|(p, e)| format!("{}{}{}", s_ppt.apply_to(short(p)), s_dim.apply_to("→"), s_excel.apply_to(short(e))))
+        .collect::<Vec<_>>()
+        .join("  ");
+    let overflow = if has_more { format!("  {}", s_dim.apply_to("...")) } else { String::new() };
+
+    let padded_name = format!("'{name}'{}", " ".repeat(name_pad.saturating_sub(name.len())));
+    let diff_label = format!("labels {diff_count}/{total} differ");
+    let prefix_plain_len = 2 + padded_name.len() + 1 + diff_label.len();
+    let gap = 41usize.saturating_sub(prefix_plain_len);
+
+    println!("           {} {} {}{}{values}{overflow}",
+        s_dim.apply_to("╰"),
+        s_name.apply_to(&padded_name),
+        s_dim.apply_to(&diff_label),
+        " ".repeat(gap));
+}
+
 /// Middle-truncate a name to max 14 display chars: first 7 + … + last 6.
 pub fn truncate_middle(name: &str) -> String {
     if name.len() <= 14 {

@@ -4,7 +4,12 @@
 //! using fresh values read from Excel. This bypasses the extremely slow
 //! `LinkFormat.Update()` COM call (~25ms/chart local, ~4s/chart network).
 //!
-//! GOTCHA #23: Only update `<c:val>` (value axis), NOT `<c:cat>` (category axis).
+//! GOTCHA #48: EVERY series reference is rebuilt — values (`val`), category labels (`cat`),
+//! series names (`tx`), scatter/bubble data (`xVal`/`yVal`/`bubbleSize`) — so the result
+//! matches PowerPoint's own "refresh link". `strRef` caches are rebuilt from display text,
+//! `numRef` caches from numbers. Multi-level categories and data-labels-from-cells are
+//! left to PowerPoint (`needs_com`).
+//! GOTCHA #23: a category range shared by every series is read once, never double-counted.
 //! GOTCHA #20: Handle non-contiguous ranges (comma-separated in `<c:f>`).
 //! GOTCHA #43: Values are `Option<f64>` — `None` is a blank Excel cell and produces
 //! NO `<c:pt>` (PowerPoint draws nothing, no label); `Some(0.0)` is a real zero point.
@@ -36,9 +41,15 @@ pub struct FixedChart {
 #[derive(Debug, Default)]
 pub struct ChartDataResult {
     pub charts_updated: usize,
+    /// Value caches (`<c:val>`) rebuilt.
     pub series_updated: usize,
+    /// Label caches rebuilt: categories, series names, xVal/yVal/bubbleSize (GOTCHA #48).
+    pub labels_updated: usize,
     /// Charts whose formulas were normalised (GOTCHA #44) — reported as warnings.
     pub fixed: Vec<FixedChart>,
+    /// Chart parts the ZIP rewrite could not fully rebuild (multi-level categories, data
+    /// labels from cells) — must be refreshed by PowerPoint's `LinkFormat.Update()`.
+    pub needs_refresh: Vec<String>,
     /// False when at least one range could not be read from Excel; the caller then
     /// keeps the COM `Update()` fallback for all charts.
     pub all_ranges_ok: bool,
@@ -47,22 +58,115 @@ pub struct ChartDataResult {
 /// Per-chart statistics from `rewrite_chart_cache`.
 #[derive(Debug, Default, PartialEq)]
 pub struct RewriteStats {
+    /// `<c:val>` caches rebuilt.
     pub series_updated: usize,
+    /// Other caches rebuilt (tx / cat / xVal / yVal / bubbleSize).
+    pub labels_updated: usize,
     pub formulas_fixed: usize,
     /// Workbook name stripped from `<c:f>` (first one seen), if any.
     pub book: Option<String>,
+    /// Chart holds a construct left to PowerPoint (multiLvlStrRef, datalabelsRange).
+    pub needs_com: bool,
 }
 
-/// Scan all chart XML files in a PPTX and collect unique range references.
+/// Which cache a reference feeds: numbers (`numRef`/`numCache`) or text (`strRef`/`strCache`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefKind {
+    Num,
+    Str,
+}
+
+/// The series element a reference belongs to (GOTCHA #48).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeriesElem {
+    Tx,
+    Cat,
+    Val,
+    XVal,
+    YVal,
+    BubbleSize,
+}
+
+impl SeriesElem {
+    fn from_local(name: &[u8]) -> Option<Self> {
+        match name {
+            b"tx" => Some(Self::Tx),
+            b"cat" => Some(Self::Cat),
+            b"val" => Some(Self::Val),
+            b"xVal" => Some(Self::XVal),
+            b"yVal" => Some(Self::YVal),
+            b"bubbleSize" => Some(Self::BubbleSize),
+            _ => None,
+        }
+    }
+}
+
+/// One cell reference inside a `<c:ser>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesRef {
+    pub elem: SeriesElem,
+    /// Raw formula text as found in `<c:f>` (may still carry `$` and `[workbook]`).
+    pub formula: String,
+    pub kind: RefKind,
+}
+
+/// Normalised range + kind: the key of the Excel read map.
+pub type RangeKey = (String, RefKind);
+
+/// Values read from Excel for one reference, shaped by its kind.
+/// `None` entries are blank cells and produce no `<c:pt>`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CacheValues {
+    Num(Vec<ChartValue>),
+    Str(Vec<Option<String>>),
+}
+
+impl CacheValues {
+    pub fn len(&self) -> usize {
+        match self {
+            CacheValues::Num(v) => v.len(),
+            CacheValues::Str(v) => v.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn empty_of(kind: RefKind) -> Self {
+        match kind {
+            RefKind::Num => CacheValues::Num(Vec::new()),
+            RefKind::Str => CacheValues::Str(Vec::new()),
+        }
+    }
+    fn extend_from(&mut self, other: &CacheValues) {
+        match (self, other) {
+            (CacheValues::Num(a), CacheValues::Num(b)) => a.extend(b.iter().copied()),
+            (CacheValues::Str(a), CacheValues::Str(b)) => a.extend(b.iter().cloned()),
+            _ => {}
+        }
+    }
+}
+
+/// Result of scanning the chart parts of a PPTX.
+#[derive(Debug, Default)]
+pub struct ChartScan {
+    /// chart part → every series reference (tx / cat / val / xVal / yVal / bubbleSize)
+    pub refs: HashMap<String, Vec<SeriesRef>>,
+    /// chart parts with constructs the ZIP rewrite cannot rebuild (multi-level categories,
+    /// data labels from cells) — refreshed by PowerPoint instead
+    pub needs_com: Vec<String>,
+}
+
+/// Scan every externally linked chart part and collect ALL series references
+/// (tx / cat / val / xVal / yVal / bubbleSize) with their kind (GOTCHA #48).
 ///
-/// Returns a map of chart XML path → list of (series_index, range_ref) pairs.
-/// Only includes charts with external links (checks chart .rels for TargetMode="External").
-pub fn scan_chart_ranges(pptx_path: &Path) -> Result<HashMap<String, Vec<String>>, String> {
+/// Charts containing constructs the ZIP rewrite cannot rebuild (multi-level categories,
+/// data labels from cells) are listed in `needs_com` and left for `LinkFormat.Update()`.
+pub fn scan_chart_ranges(pptx_path: &Path) -> Result<ChartScan, String> {
     let data = std::fs::read(pptx_path).map_err(|e| format!("Failed to read PPTX: {e}"))?;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&data))
         .map_err(|e| format!("Failed to open ZIP: {e}"))?;
 
-    let mut result: HashMap<String, Vec<String>> = HashMap::new();
+    let mut scan = ChartScan::default();
 
     // Collect all chart XML filenames
     let chart_names: Vec<String> = (0..archive.len())
@@ -85,30 +189,31 @@ pub fn scan_chart_ranges(pptx_path: &Path) -> Result<HashMap<String, Vec<String>
             continue;
         }
 
-        // Parse chart XML for series value range references
         let xml = match read_entry(&mut archive, chart_name) {
             Some(data) => data,
             None => continue,
         };
 
-        let refs = extract_val_refs(&xml);
+        let (refs, needs_com) = extract_series_refs_all(&xml);
+        if needs_com {
+            scan.needs_com.push(chart_name.clone());
+        }
         if !refs.is_empty() {
-            result.insert(chart_name.clone(), refs);
+            scan.refs.insert(chart_name.clone(), refs);
         }
     }
 
-    Ok(result)
+    Ok(scan)
 }
 
-/// Update chart numCache values in the PPTX ZIP.
+/// Update every series cache (values, categories, series names, …) in the PPTX ZIP.
 ///
-/// `range_values` maps normalized range ref (e.g., "Tables!C388:C390") → `Vec<ChartValue>`
-/// (`None` = blank cell = no point). The PPTX is modified in-place via temp file + rename.
-///
-/// Returns the count of charts and series updated.
+/// `range_values` maps `(normalized range, kind)` (e.g. `("Tables!C388:C390", Num)`) →
+/// the Excel cells (`None` = blank = no point). The PPTX is modified in-place via temp
+/// file + rename.
 pub fn update_chart_data(
     pptx_path: &Path,
-    range_values: &HashMap<String, Vec<ChartValue>>,
+    range_values: &HashMap<RangeKey, CacheValues>,
 ) -> Result<ChartDataResult, String> {
     let data = std::fs::read(pptx_path).map_err(|e| format!("Failed to read PPTX: {e}"))?;
     let mut reader = zip::ZipArchive::new(std::io::Cursor::new(&data))
@@ -121,7 +226,9 @@ pub fn update_chart_data(
 
     let mut charts_updated = 0usize;
     let mut series_updated = 0usize;
+    let mut labels_updated = 0usize;
     let mut fixed: Vec<FixedChart> = Vec::new();
+    let mut needs_refresh: Vec<String> = Vec::new();
 
     // Pre-collect chart names, then check external links in a separate pass
     let all_chart_names: Vec<String> = (0..reader.len())
@@ -159,9 +266,13 @@ pub fn update_chart_data(
                 Ok((modified_xml, stats)) => {
                     writer.start_file(&name, options).map_err(|e| format!("ZIP write error: {e}"))?;
                     writer.write_all(&modified_xml).map_err(|e| format!("ZIP write error: {e}"))?;
-                    if stats.series_updated > 0 {
+                    if stats.series_updated > 0 || stats.labels_updated > 0 {
                         charts_updated += 1;
                         series_updated += stats.series_updated;
+                        labels_updated += stats.labels_updated;
+                    }
+                    if stats.needs_com {
+                        needs_refresh.push(name.clone());
                     }
                     if stats.formulas_fixed > 0 {
                         fixed.push(FixedChart {
@@ -189,7 +300,9 @@ pub fn update_chart_data(
         format!("Failed to replace PPTX: {e}")
     })?;
 
-    Ok(ChartDataResult { charts_updated, series_updated, fixed, all_ranges_ok: true })
+    Ok(ChartDataResult {
+        charts_updated, series_updated, labels_updated, fixed, needs_refresh, all_ranges_ok: true,
+    })
 }
 
 /// Write `<c:pt idx="i"><c:v>val</c:v></c:pt>` for every `Some` value, ascending idx.
@@ -219,22 +332,67 @@ fn write_points(
     Ok(())
 }
 
-/// Rewrite `<c:numCache>` values in chart XML using streaming quick-xml.
+/// Write `<c:pt idx="i"><c:v>text</c:v></c:pt>` for every `Some` string (strCache).
+/// Blank cells (`None`) produce no element, exactly like numeric blanks.
+fn write_str_points(
+    writer: &mut quick_xml::writer::Writer<Vec<u8>>,
+    vals: &[Option<String>],
+) -> Result<(), String> {
+    use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+
+    for (idx, val) in vals.iter().enumerate() {
+        let Some(s) = val else { continue };
+        let mut pt_start = BytesStart::new("c:pt");
+        pt_start.push_attribute(("idx", idx.to_string().as_str()));
+        writer.write_event(Event::Start(pt_start)).map_err(|e| e.to_string())?;
+        writer.write_event(Event::Start(BytesStart::new("c:v"))).map_err(|e| e.to_string())?;
+        writer.write_event(Event::Text(BytesText::new(s))).map_err(|e| e.to_string())?;
+        writer.write_event(Event::End(BytesEnd::new("c:v"))).map_err(|e| e.to_string())?;
+        writer.write_event(Event::End(BytesEnd::new("c:pt"))).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Values for `raw_ref` of `kind`, concatenating comma-separated sub-ranges (GOTCHA #20).
+fn lookup_values(
+    range_values: &HashMap<RangeKey, CacheValues>,
+    raw_ref: &str,
+    kind: RefKind,
+) -> Option<CacheValues> {
+    let normalized = normalize_range_ref(raw_ref);
+    if let Some(v) = range_values.get(&(normalized.clone(), kind)) {
+        return Some(v.clone());
+    }
+    if normalized.contains(',') {
+        let mut combined = CacheValues::empty_of(kind);
+        for sub in normalized.split(',') {
+            let part = range_values.get(&(sub.trim().to_string(), kind))?;
+            combined.extend_from(part);
+        }
+        if !combined.is_empty() {
+            return Some(combined);
+        }
+    }
+    None
+}
+
+/// Rewrite every series cache in a chart part using streaming quick-xml.
 ///
-/// For each `<c:ser>/<c:val>/<c:numRef>` whose `<c:f>` range is in `range_values`,
-/// the cache is REBUILT: existing `<c:pt>` elements are dropped, `<c:ptCount>` is set
-/// to the Excel value count, and a fresh `<c:pt>` is emitted for every `Some` value in
-/// ascending idx order (none for `None`). This fills holes at any position and removes
-/// stale points (GOTCHA #43, superseding the trailing-only logic of #36/#37).
-/// Series whose range is not in the map pass through byte-for-byte.
+/// For each `<c:ser>` element (`tx`, `cat`, `val`, `xVal`, `yVal`, `bubbleSize`) whose
+/// reference is in `range_values`, the cache is REBUILT: existing `<c:pt>` elements are
+/// dropped, `<c:ptCount>` is set to the Excel cell count, and a fresh `<c:pt>` is emitted
+/// for every `Some` value in ascending idx order (none for `None`). Numeric caches keep
+/// per-point `formatCode` attributes (GOTCHA #43); string caches get plain text points
+/// (GOTCHA #48). Series whose reference is not in the map pass through byte-for-byte.
+/// `multiLvlStrRef` and `c15:datalabelsRange` are left untouched and flagged in
+/// `stats.needs_com` so the chart is refreshed by PowerPoint instead.
 ///
-/// GOTCHA #44: every `<c:f>` (tx, cat, val) that carries a `[workbook]` qualifier is
-/// rewritten without it, so the chart resolves against whatever workbook it is linked to.
+/// GOTCHA #44: every `<c:f>` that carries a `[workbook]` qualifier is rewritten without it.
 ///
 /// Returns (modified_xml, stats).
 fn rewrite_chart_cache(
     xml: &[u8],
-    range_values: &HashMap<String, Vec<ChartValue>>,
+    range_values: &HashMap<RangeKey, CacheValues>,
 ) -> Result<(Vec<u8>, RewriteStats), String> {
     use quick_xml::events::{BytesText, Event};
     use quick_xml::reader::Reader;
@@ -245,22 +403,31 @@ fn rewrite_chart_cache(
 
     // State machine for tracking position in XML hierarchy
     let mut in_ser = false;
-    let mut in_val = false;      // inside <c:val> (NOT <c:cat> — GOTCHA #23)
-    let mut in_num_ref = false;
-    let mut in_num_cache = false;
-    let mut in_f = false;        // inside <c:ser>/<c:val>/<c:numRef>/<c:f> (range we rebuild)
-    let mut in_any_f = false;    // inside ANY <c:f> (tx/cat/val — prefix stripping, GOTCHA #44)
-    let mut in_pt = false;       // inside <c:pt>
+    let mut cur_elem: Option<SeriesElem> = None; // tx / cat / val / xVal / yVal / bubbleSize
+    let mut cur_kind: Option<RefKind> = None;    // inside numRef / strRef of cur_elem
+    let mut in_cache = false;                    // inside numCache / strCache of that ref
+    let mut in_f = false;                        // inside the <c:f> of a numRef/strRef
+    let mut in_any_f = false;                    // inside ANY <c:f> (prefix stripping, GOTCHA #44)
+    let mut in_pt = false;                       // inside <c:pt>
 
     let mut current_range_ref = String::new();
-    let mut current_values: Option<&Vec<ChartValue>> = None;
-    let mut combined_values_buf: Option<Vec<ChartValue>> = None; // Buffer for non-contiguous ranges
+    let mut current_values: Option<CacheValues> = None;
     let mut stats = RewriteStats::default();
 
-    // Rebuild state for the numCache currently being rewritten
-    let mut rebuild = false;          // true while inside a numCache we own
+    // Rebuild state for the cache currently being rewritten
+    let mut rebuild = false;          // true while inside a cache we own
     let mut flushed = false;          // new <c:pt>s already emitted for this cache
     let mut pt_format_codes: HashMap<usize, String> = HashMap::new();
+
+    macro_rules! flush_points {
+        () => {
+            match current_values.as_ref() {
+                Some(CacheValues::Num(v)) => write_points(&mut writer, v, &pt_format_codes)?,
+                Some(CacheValues::Str(v)) => write_str_points(&mut writer, v)?,
+                None => {}
+            }
+        };
+    }
 
     loop {
         match reader.read_event() {
@@ -270,41 +437,22 @@ fn rewrite_chart_cache(
                 let local = e.local_name();
                 match local.as_ref() {
                     b"ser" => { in_ser = true; }
-                    b"val" if in_ser => { in_val = true; }
-                    b"numRef" if in_val => { in_num_ref = true; }
+                    b"numRef" if cur_elem.is_some() => { cur_kind = Some(RefKind::Num); }
+                    b"strRef" if cur_elem.is_some() => { cur_kind = Some(RefKind::Str); }
+                    b"multiLvlStrRef" if cur_elem.is_some() => { stats.needs_com = true; }
+                    b"datalabelsRange" => { stats.needs_com = true; }
                     b"f" => {
                         in_any_f = true;
-                        if in_num_ref { in_f = true; }
+                        if cur_kind.is_some() { in_f = true; }
                     }
-                    b"numCache" if in_num_ref => {
-                        in_num_cache = true;
+                    b"numCache" | b"strCache" if cur_kind.is_some() => {
+                        in_cache = true;
                         flushed = false;
                         pt_format_codes.clear();
-                        // Look up values for current range ref.
-                        // For non-contiguous ranges (GOTCHA #20), split on commas
-                        // and concatenate values from each sub-range.
-                        let normalized = normalize_range_ref(&current_range_ref);
-                        current_values = range_values.get(&normalized);
-                        if current_values.is_none() && normalized.contains(',') {
-                            let mut combined = Vec::new();
-                            let mut all_found = true;
-                            for sub in normalized.split(',') {
-                                let sub = sub.trim();
-                                if let Some(vals) = range_values.get(sub) {
-                                    combined.extend(vals.iter().copied());
-                                } else {
-                                    all_found = false;
-                                    break;
-                                }
-                            }
-                            if all_found && !combined.is_empty() {
-                                combined_values_buf = Some(combined);
-                                current_values = combined_values_buf.as_ref();
-                            }
-                        }
+                        current_values = lookup_values(range_values, &current_range_ref, cur_kind.unwrap_or(RefKind::Num));
                         rebuild = current_values.is_some();
                     }
-                    b"pt" if in_num_cache => {
+                    b"pt" if in_cache => {
                         in_pt = true;
                         if rebuild {
                             // Swallow the old point; remember its formatCode (if any) by idx
@@ -316,15 +464,19 @@ fn rewrite_chart_cache(
                             }
                         }
                     }
-                    _ if in_num_cache && rebuild && !in_pt && !flushed => {
-                        // A non-pt child after the points (e.g. <c:extLst>): emit the new
-                        // points first so they keep their schema position.
-                        if let Some(vals) = current_values {
-                            write_points(&mut writer, vals, &pt_format_codes)?;
-                        }
+                    b"extLst" if in_cache && rebuild && !in_pt && !flushed => {
+                        // <c:extLst> follows the points in the schema: emit the new points first
+                        flush_points!();
                         flushed = true;
                     }
-                    _ => {}
+                    other => {
+                        if in_ser && cur_elem.is_none()
+                            && let Some(el) = SeriesElem::from_local(other)
+                        {
+                            cur_elem = Some(el);
+                            current_range_ref.clear();
+                        }
+                    }
                 }
                 if !(rebuild && in_pt) {
                     writer.write_event(Event::Start(e.clone())).map_err(|e| e.to_string())?;
@@ -337,26 +489,26 @@ fn rewrite_chart_cache(
                 match local.as_ref() {
                     b"ser" => {
                         in_ser = false;
-                        in_val = false;
-                        in_num_ref = false;
-                        in_num_cache = false;
+                        cur_elem = None;
+                        cur_kind = None;
+                        in_cache = false;
                         current_range_ref.clear();
                         current_values = None;
-                        drop(combined_values_buf.take());
                     }
-                    b"val" => { in_val = false; in_num_ref = false; in_num_cache = false; }
-                    b"numRef" => { in_num_ref = false; in_num_cache = false; }
-                    b"numCache" => {
+                    b"numRef" | b"strRef" => { cur_kind = None; in_cache = false; }
+                    b"numCache" | b"strCache" => {
                         if rebuild {
-                            if !flushed
-                                && let Some(vals) = current_values {
-                                    write_points(&mut writer, vals, &pt_format_codes)?;
-                                }
+                            if !flushed {
+                                flush_points!();
+                            }
                             flushed = true;
-                            stats.series_updated += 1;
+                            match cur_elem {
+                                Some(SeriesElem::Val) => stats.series_updated += 1,
+                                _ => stats.labels_updated += 1,
+                            }
                         }
                         rebuild = false;
-                        in_num_cache = false;
+                        in_cache = false;
                     }
                     b"f" => { in_f = false; in_any_f = false; }
                     b"pt" => {
@@ -364,7 +516,17 @@ fn rewrite_chart_cache(
                         in_pt = false;
                     }
                     b"v" => { skip_write = rebuild && in_pt; }
-                    _ => {}
+                    other => {
+                        if let Some(el) = SeriesElem::from_local(other)
+                            && cur_elem == Some(el)
+                        {
+                            cur_elem = None;
+                            cur_kind = None;
+                            in_cache = false;
+                            current_range_ref.clear();
+                            current_values = None;
+                        }
+                    }
                 }
                 if !skip_write {
                     writer.write_event(Event::End(e.clone())).map_err(|e| e.to_string())?;
@@ -373,10 +535,10 @@ fn rewrite_chart_cache(
 
             Ok(Event::Empty(ref e)) => {
                 let local = e.local_name();
-                if in_num_cache && rebuild {
+                if in_cache && rebuild {
                     if local.as_ref() == b"ptCount" {
-                        // ptCount = total categories, blanks included
-                        if let Some(vals) = current_values {
+                        // ptCount = total cells, blanks included
+                        if let Some(vals) = current_values.as_ref() {
                             let mut elem = e.clone();
                             elem.clear_attributes();
                             elem.push_attribute(("val", vals.len().to_string().as_str()));
@@ -387,6 +549,8 @@ fn rewrite_chart_cache(
                         // Degenerate self-closing point — drop it, we rebuild all points
                         continue;
                     }
+                } else if local.as_ref() == b"datalabelsRange" {
+                    stats.needs_com = true;
                 }
                 writer.write_event(Event::Empty(e.clone())).map_err(|e| e.to_string())?;
             }
@@ -396,8 +560,8 @@ fn rewrite_chart_cache(
                     // GOTCHA #44: drop any `[workbook]` qualifier from the formula text.
                     let raw = String::from_utf8_lossy(t.as_ref()).to_string();
                     let (book, cleaned) = strip_formula_prefixes(&raw);
-                    if in_f && in_num_ref && in_val {
-                        // Capture the (cleaned) value range reference for the cache rebuild
+                    if in_f {
+                        // Capture the (cleaned) reference for the cache rebuild
                         current_range_ref = cleaned.clone();
                     }
                     if let Some(book) = book {
@@ -426,43 +590,68 @@ fn rewrite_chart_cache(
     Ok((writer.into_inner(), stats))
 }
 
-/// Extract value-axis range references from chart XML.
-/// Only extracts `<c:ser>/<c:val>/<c:numRef>/<c:f>` — NOT `<c:cat>` (GOTCHA #23).
-fn extract_val_refs(xml: &str) -> Vec<String> {
+/// Every cell reference inside `<c:ser>` elements: `tx`, `cat`, `val`, `xVal`, `yVal`,
+/// `bubbleSize`, with the kind taken from the enclosing `numRef` / `strRef`.
+/// The bool is true when the chart holds a `multiLvlStrRef` or a `c15:datalabelsRange`
+/// (constructs the ZIP rewrite leaves to PowerPoint).
+pub fn extract_series_refs_all(xml: &str) -> (Vec<SeriesRef>, bool) {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
 
     let mut reader = Reader::from_reader(xml.as_bytes());
     let mut refs = Vec::new();
+    let mut needs_com = false;
     let mut in_ser = false;
-    let mut in_val = false;
-    let mut in_num_ref = false;
-    let mut found_for_series = false;
+    let mut cur_elem: Option<SeriesElem> = None;
+    let mut cur_kind: Option<RefKind> = None;
+    let mut in_f = false;
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
-                match e.local_name().as_ref() {
-                    b"ser" => { in_ser = true; found_for_series = false; }
-                    b"val" if in_ser => { in_val = true; }
-                    b"numRef" if in_val => { in_num_ref = true; }
-                    _ => {}
+                let local = e.local_name();
+                match local.as_ref() {
+                    b"ser" => { in_ser = true; }
+                    b"numRef" if cur_elem.is_some() => { cur_kind = Some(RefKind::Num); }
+                    b"strRef" if cur_elem.is_some() => { cur_kind = Some(RefKind::Str); }
+                    b"multiLvlStrRef" if cur_elem.is_some() => { needs_com = true; }
+                    b"datalabelsRange" => { needs_com = true; }
+                    b"f" if cur_kind.is_some() => { in_f = true; }
+                    other => {
+                        if in_ser && cur_elem.is_none()
+                            && let Some(el) = SeriesElem::from_local(other)
+                        {
+                            cur_elem = Some(el);
+                        }
+                    }
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                if e.local_name().as_ref() == b"datalabelsRange" {
+                    needs_com = true;
                 }
             }
             Ok(Event::End(ref e)) => {
-                match e.local_name().as_ref() {
-                    b"ser" => { in_ser = false; in_val = false; in_num_ref = false; }
-                    b"val" => { in_val = false; in_num_ref = false; }
-                    b"numRef" => { in_num_ref = false; }
-                    _ => {}
+                let local = e.local_name();
+                match local.as_ref() {
+                    b"ser" => { in_ser = false; cur_elem = None; cur_kind = None; in_f = false; }
+                    b"numRef" | b"strRef" => { cur_kind = None; in_f = false; }
+                    b"f" => { in_f = false; }
+                    other => {
+                        if let Some(el) = SeriesElem::from_local(other)
+                            && cur_elem == Some(el)
+                        {
+                            cur_elem = None;
+                            cur_kind = None;
+                        }
+                    }
                 }
             }
             Ok(Event::Text(ref t)) => {
-                if in_ser && in_val && in_num_ref && !found_for_series {
-                    let text = String::from_utf8_lossy(t.as_ref()).to_string();
-                    if !text.trim().is_empty() {
-                        refs.push(text.trim().to_string());
-                        found_for_series = true;
+                if in_f && let (Some(elem), Some(kind)) = (cur_elem, cur_kind) {
+                    let text = String::from_utf8_lossy(t.as_ref()).trim().to_string();
+                    if !text.is_empty() {
+                        refs.push(SeriesRef { elem, formula: text, kind });
                     }
                 }
             }
@@ -471,7 +660,17 @@ fn extract_val_refs(xml: &str) -> Vec<String> {
             _ => {}
         }
     }
-    refs
+    (refs, needs_com)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+/// Value-axis references only (`<c:val>`), in series order — kept for callers that
+/// key series by their value range.
+pub fn extract_val_refs(xml: &str) -> Vec<String> {
+    extract_series_refs_all(xml).0.into_iter()
+        .filter(|r| r.elem == SeriesElem::Val)
+        .map(|r| r.formula)
+        .collect()
 }
 
 /// Normalize a range reference for HashMap lookup and for reading from Excel.
@@ -551,23 +750,177 @@ fn read_entry(archive: &mut zip::ZipArchive<std::io::Cursor<&Vec<u8>>>, name: &s
     Some(data)
 }
 
-/// Collect all unique range references from chart scan results.
-/// Normalizes refs (strip $, parens) and splits non-contiguous ranges (GOTCHA #20).
-pub fn collect_unique_ranges(chart_ranges: &HashMap<String, Vec<String>>) -> Vec<String> {
+/// Collect all unique `(normalised range, kind)` keys from a scan.
+/// Strips `$`, parens and `[workbook]` (GOTCHA #44) and splits non-contiguous ranges (#20).
+/// Sorted for deterministic COM read order.
+pub fn collect_unique_ranges(chart_refs: &HashMap<String, Vec<SeriesRef>>) -> Vec<RangeKey> {
     let mut unique = std::collections::HashSet::new();
-    for refs in chart_ranges.values() {
-        for range_ref in refs {
-            let normalized = normalize_range_ref(range_ref);
-            // Split non-contiguous ranges (GOTCHA #20)
+    for refs in chart_refs.values() {
+        for r in refs {
+            let normalized = normalize_range_ref(&r.formula);
             for sub in normalized.split(',') {
                 let sub = sub.trim();
                 if !sub.is_empty() {
-                    unique.insert(sub.to_string());
+                    unique.insert((sub.to_string(), r.kind));
                 }
             }
         }
     }
-    unique.into_iter().collect()
+    let mut keys: Vec<RangeKey> = unique.into_iter().collect();
+    keys.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| (a.1 as u8).cmp(&(b.1 as u8))));
+    keys
+}
+
+/// Cached category labels and series name of one series, as PowerPoint stores them
+/// (for `oa check`, GOTCHA #48). Numeric categories are reported as `cat_ref = None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeriesLabels {
+    pub cat_ref: Option<String>,
+    pub cat: Vec<Option<String>>,
+    pub tx_ref: Option<String>,
+    /// Series name cache — one point per referenced cell (a multi-cell name such as
+    /// `Tables!$L$1067:$L$1069` is stored as three points, exactly as PowerPoint does).
+    pub tx: Vec<Option<String>>,
+    pub multi_level: bool,
+}
+
+/// Extract cached `tx` / `cat` strings per series (order = series order).
+pub fn extract_cached_labels(xml: &str) -> Vec<SeriesLabels> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_reader(xml.as_bytes());
+    let mut out: Vec<SeriesLabels> = Vec::new();
+    let mut cur: SeriesLabels = SeriesLabels::default();
+
+    let mut in_ser = false;
+    let mut cur_elem: Option<SeriesElem> = None;
+    let mut in_str_ref = false;
+    let mut in_f = false;
+    let mut in_cache = false;
+    let mut in_pt = false;
+    let mut in_v = false;
+    let mut pt_idx = 0usize;
+    let mut pt_count = 0usize;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                let local = e.local_name();
+                match local.as_ref() {
+                    b"ser" => { in_ser = true; cur = SeriesLabels::default(); }
+                    b"strRef" if matches!(cur_elem, Some(SeriesElem::Tx) | Some(SeriesElem::Cat)) => { in_str_ref = true; }
+                    b"multiLvlStrRef" if cur_elem == Some(SeriesElem::Cat) => { cur.multi_level = true; }
+                    b"f" if in_str_ref => { in_f = true; }
+                    b"strCache" if in_str_ref => { in_cache = true; pt_count = 0; }
+                    b"pt" if in_cache => {
+                        in_pt = true;
+                        pt_idx = e.try_get_attribute("idx").ok().flatten()
+                            .and_then(|a| String::from_utf8_lossy(a.value.as_ref()).parse::<usize>().ok())
+                            .unwrap_or(0);
+                        match cur_elem {
+                            Some(SeriesElem::Cat) => { while cur.cat.len() <= pt_idx { cur.cat.push(None); } }
+                            Some(SeriesElem::Tx) => { while cur.tx.len() <= pt_idx { cur.tx.push(None); } }
+                            _ => {}
+                        }
+                    }
+                    b"v" if in_pt => { in_v = true; }
+                    other => {
+                        if in_ser && cur_elem.is_none()
+                            && let Some(el) = SeriesElem::from_local(other)
+                        {
+                            cur_elem = Some(el);
+                        }
+                    }
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                if in_cache && e.local_name().as_ref() == b"ptCount" {
+                    pt_count = e.try_get_attribute("val").ok().flatten()
+                        .and_then(|a| String::from_utf8_lossy(a.value.as_ref()).parse::<usize>().ok())
+                        .unwrap_or(0);
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let local = e.local_name();
+                match local.as_ref() {
+                    b"ser" => {
+                        in_ser = false; cur_elem = None; in_str_ref = false; in_cache = false;
+                        out.push(std::mem::take(&mut cur));
+                    }
+                    b"strRef" => { in_str_ref = false; in_cache = false; }
+                    b"strCache" => {
+                        match cur_elem {
+                            Some(SeriesElem::Cat) => { while cur.cat.len() < pt_count { cur.cat.push(None); } }
+                            Some(SeriesElem::Tx) => { while cur.tx.len() < pt_count { cur.tx.push(None); } }
+                            _ => {}
+                        }
+                        in_cache = false;
+                    }
+                    b"f" => { in_f = false; }
+                    b"pt" => { in_pt = false; }
+                    b"v" => { in_v = false; }
+                    other => {
+                        if let Some(el) = SeriesElem::from_local(other)
+                            && cur_elem == Some(el)
+                        {
+                            cur_elem = None;
+                            in_str_ref = false;
+                            in_cache = false;
+                        }
+                    }
+                }
+            }
+            Ok(Event::Text(ref t)) => {
+                let text = String::from_utf8_lossy(t.as_ref()).to_string();
+                if in_f {
+                    match cur_elem {
+                        Some(SeriesElem::Cat) => cur.cat_ref = Some(text.trim().to_string()),
+                        Some(SeriesElem::Tx) => cur.tx_ref = Some(text.trim().to_string()),
+                        _ => {}
+                    }
+                } else if in_v && in_pt && in_cache {
+                    let slot = match cur_elem {
+                        Some(SeriesElem::Cat) => cur.cat.get_mut(pt_idx),
+                        Some(SeriesElem::Tx) => cur.tx.get_mut(pt_idx),
+                        _ => None,
+                    };
+                    if let Some(slot) = slot {
+                        slot.get_or_insert_with(String::new).push_str(&text);
+                    }
+                }
+            }
+            Ok(Event::GeneralRef(ref r)) => {
+                // `&amp;` etc. arrive as separate events (quick-xml >= 0.37)
+                if in_v && in_pt && in_cache {
+                    let piece = if let Ok(Some(c)) = r.resolve_char_ref() {
+                        c.to_string()
+                    } else {
+                        match r.decode().unwrap_or_default().as_ref() {
+                            "amp" => "&".to_string(),
+                            "lt" => "<".to_string(),
+                            "gt" => ">".to_string(),
+                            "quot" => "\"".to_string(),
+                            "apos" => "'".to_string(),
+                            other => format!("&{other};"),
+                        }
+                    };
+                    let slot = match cur_elem {
+                        Some(SeriesElem::Cat) => cur.cat.get_mut(pt_idx),
+                        Some(SeriesElem::Tx) => cur.tx.get_mut(pt_idx),
+                        _ => None,
+                    };
+                    if let Some(slot) = slot {
+                        slot.get_or_insert_with(String::new).push_str(&piece);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Extract cached numCache values from chart XML per series.
@@ -736,17 +1089,25 @@ mod tests {
         assert_eq!(normalize_range_ref("(Tables!$C$810,Tables!$F$810)"), "Tables!C810,Tables!F810");
     }
 
+    fn sref(elem: SeriesElem, formula: &str, kind: RefKind) -> SeriesRef {
+        SeriesRef { elem, formula: formula.to_string(), kind }
+    }
+
     #[test]
     fn test_collect_unique_ranges() {
         let mut chart_ranges = HashMap::new();
         chart_ranges.insert("chart1.xml".to_string(), vec![
-            "Tables!$B$388:$B$390".to_string(),
-            "(Tables!$C$810,Tables!$F$810)".to_string(),
+            sref(SeriesElem::Val, "Tables!$B$388:$B$390", RefKind::Num),
+            sref(SeriesElem::Val, "(Tables!$C$810,Tables!$F$810)", RefKind::Num),
+            sref(SeriesElem::Cat, "Tables!$A$388:$A$390", RefKind::Str),
+            sref(SeriesElem::Cat, "Tables!$A$388:$A$390", RefKind::Str), // shared by a 2nd series → once
         ]);
         let unique = collect_unique_ranges(&chart_ranges);
-        assert!(unique.contains(&"Tables!B388:B390".to_string()));
-        assert!(unique.contains(&"Tables!C810".to_string()));
-        assert!(unique.contains(&"Tables!F810".to_string()));
+        assert!(unique.contains(&("Tables!B388:B390".to_string(), RefKind::Num)));
+        assert!(unique.contains(&("Tables!C810".to_string(), RefKind::Num)));
+        assert!(unique.contains(&("Tables!F810".to_string(), RefKind::Num)));
+        assert!(unique.contains(&("Tables!A388:A390".to_string(), RefKind::Str)));
+        assert_eq!(unique.len(), 4, "shared category range counted once (GOTCHA #23)");
     }
 
     #[test]
@@ -785,8 +1146,7 @@ mod tests {
 </c:numCache></c:numRef></c:val></c:ser>
 </c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
 
-        let mut values = HashMap::new();
-        values.insert("Tables!B1:B3".to_string(), vec![Some(0.5), Some(0.6), Some(0.7)]);
+        let values = vals("Tables!B1:B3", vec![Some(0.5), Some(0.6), Some(0.7)]);
 
         let (output, st) = rewrite_chart_cache(xml, &values).unwrap();
         let output_str = String::from_utf8(output).unwrap();
@@ -841,10 +1201,34 @@ mod tests {
         val[p..p + val[p..].find('"').unwrap()].parse().unwrap()
     }
 
-    fn vals(range: &str, v: Vec<ChartValue>) -> HashMap<String, Vec<ChartValue>> {
+    fn vals(range: &str, v: Vec<ChartValue>) -> HashMap<RangeKey, CacheValues> {
         let mut m = HashMap::new();
-        m.insert(range.to_string(), v);
+        m.insert((range.to_string(), RefKind::Num), CacheValues::Num(v));
         m
+    }
+
+    fn strs(range: &str, v: &[Option<&str>]) -> (RangeKey, CacheValues) {
+        ((range.to_string(), RefKind::Str), CacheValues::Str(v.iter().map(|s| s.map(|x| x.to_string())).collect()))
+    }
+
+    /// (idx, value-text) of every <c:pt> inside the FIRST `<c:{elem}>` block.
+    fn pts_in(xml: &str, elem: &str) -> Vec<(usize, String)> {
+        let open = format!("<c:{elem}>");
+        let close = format!("</c:{elem}>");
+        let start = xml.find(&open).unwrap_or_else(|| panic!("no {open}"));
+        let block = &xml[start..xml[start..].find(&close).map(|p| start + p).expect("no close")];
+        let mut out = Vec::new();
+        let mut rest = block;
+        while let Some(p) = rest.find("<c:pt idx=\"") {
+            let after = &rest[p + 11..];
+            let idx_end = after.find('"').unwrap();
+            let idx: usize = after[..idx_end].parse().unwrap();
+            let v_start = after.find("<c:v>").unwrap() + 5;
+            let v_end = after.find("</c:v>").unwrap();
+            out.push((idx, after[v_start..v_end].to_string()));
+            rest = &after[v_end..];
+        }
+        out
     }
 
     // ── rewrite: holes anywhere ─────────────────────────────
@@ -995,8 +1379,8 @@ mod tests {
 </c:numRef></c:val></c:ser>
 </c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
         let mut m = HashMap::new();
-        m.insert("Tables!C10".to_string(), vec![Some(0.7)]);
-        m.insert("Tables!F10".to_string(), vec![None]);
+        m.insert(("Tables!C10".to_string(), RefKind::Num), CacheValues::Num(vec![Some(0.7)]));
+        m.insert(("Tables!F10".to_string(), RefKind::Num), CacheValues::Num(vec![None]));
         let (out, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert_eq!(st.series_updated, 1);
@@ -1014,8 +1398,8 @@ mod tests {
 <c:ser><c:val><c:numRef><c:f>Tables!$D$1:$D$2</c:f><c:numCache><c:ptCount val="2"/></c:numCache></c:numRef></c:val></c:ser>
 </c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
         let mut m = HashMap::new();
-        m.insert("Tables!B1:B2".to_string(), vec![Some(1.0), Some(2.0)]);
-        m.insert("Tables!C1:C2".to_string(), vec![Some(3.0), None]);
+        m.insert(("Tables!B1:B2".to_string(), RefKind::Num), CacheValues::Num(vec![Some(1.0), Some(2.0)]));
+        m.insert(("Tables!C1:C2".to_string(), RefKind::Num), CacheValues::Num(vec![Some(3.0), None]));
         // D not in map → untouched
         let (_, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
         assert_eq!(st.series_updated, 2);
@@ -1148,10 +1532,205 @@ mod tests {
     fn test_collect_unique_ranges_strips_prefix() {
         let mut chart_ranges = HashMap::new();
         chart_ranges.insert("chart99.xml".to_string(), vec![
-            "[rpm_2025_Indonesia_v5.xlsx]Tables!$V$778:$Y$778".to_string(),
+            sref(SeriesElem::Val, "[rpm_2025_Indonesia_v5.xlsx]Tables!$V$778:$Y$778", RefKind::Num),
         ]);
         let unique = collect_unique_ranges(&chart_ranges);
-        assert_eq!(unique, vec!["Tables!V778:Y778".to_string()]);
+        assert_eq!(unique, vec![("Tables!V778:Y778".to_string(), RefKind::Num)]);
+    }
+
+    // ── GOTCHA #48: categories, series names, other refs ───
+
+    /// Chart 11 shape: tx + cat (strRef) + val, Indonesia labels cached.
+    fn labelled_chart() -> &'static str {
+        r#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+<c:chart><c:plotArea><c:barChart>
+<c:ser><c:idx val="0"/>
+<c:tx><c:strRef><c:f>Tables!$L$728</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>Market  </c:v></c:pt></c:strCache></c:strRef></c:tx>
+<c:cat><c:strRef><c:f>Tables!$A$729:$A$733</c:f><c:strCache><c:ptCount val="5"/>
+<c:pt idx="0"><c:v>Outdoor Ads</c:v></c:pt><c:pt idx="1"><c:v>In-person: Saw Someone Using</c:v></c:pt>
+<c:pt idx="2"><c:v>Ad / Promotion</c:v></c:pt><c:pt idx="3"><c:v>Tv / Streaming (ads Or Content)</c:v></c:pt>
+<c:pt idx="4"><c:v>E-cigarettes / Vapes (general)</c:v></c:pt></c:strCache></c:strRef></c:cat>
+<c:val><c:numRef><c:f>Tables!$L$729:$L$733</c:f><c:numCache><c:formatCode>0%</c:formatCode><c:ptCount val="5"/>
+<c:pt idx="0"><c:v>0.24</c:v></c:pt><c:pt idx="1"><c:v>0.17</c:v></c:pt><c:pt idx="2"><c:v>0.12</c:v></c:pt>
+<c:pt idx="3"><c:v>0.11</c:v></c:pt><c:pt idx="4"><c:v>0.1</c:v></c:pt></c:numCache></c:numRef></c:val>
+</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#
+    }
+
+    #[test]
+    fn test_rewrite_rebuilds_categories_series_name_and_values() {
+        let mut m = vals("Tables!L729:L733", vec![Some(0.29), Some(0.07), Some(0.05), Some(0.04), Some(0.03)]);
+        let (k, v) = strs("Tables!A729:A733", &[
+            Some("Health Risks / Safety Concerns"), Some("Cigarettes & Vapes"),
+            Some("Harm Reduction / 'safer' <alt>"), Some("Negative (general)"), Some("E-cigarettes / Vapes (general)"),
+        ]);
+        m.insert(k, v);
+        let (k, v) = strs("Tables!L728", &[Some("France  ")]);
+        m.insert(k, v);
+
+        let (out, st) = rewrite_chart_cache(labelled_chart().as_bytes(), &m).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(st.series_updated, 1);
+        assert_eq!(st.labels_updated, 2, "cat + tx");
+        assert!(!st.needs_com);
+
+        assert_eq!(pts_in(&s, "tx"), vec![(0, "France  ".into())]);
+        assert_eq!(pts_in(&s, "cat"), vec![
+            (0, "Health Risks / Safety Concerns".into()),
+            (1, "Cigarettes &amp; Vapes".into()),
+            (2, "Harm Reduction / &apos;safer&apos; &lt;alt&gt;".into()),
+            (3, "Negative (general)".into()),
+            (4, "E-cigarettes / Vapes (general)".into()),
+        ]);
+        assert_eq!(pts_in(&s, "val"), vec![
+            (0, "0.29".into()), (1, "0.07".into()), (2, "0.05".into()), (3, "0.04".into()), (4, "0.03".into()),
+        ]);
+        assert!(!s.contains("Outdoor Ads"), "stale label must be gone");
+        // formatCode / ptCount still precede the first point (schema order)
+        let v = &s[s.find("<c:val>").unwrap()..];
+        assert!(v.find("<c:formatCode>").unwrap() < v.find("<c:ptCount").unwrap());
+        assert!(v.find("<c:ptCount").unwrap() < v.find("<c:pt idx").unwrap());
+    }
+
+    #[test]
+    fn test_rewrite_labels_only_when_values_missing_from_map() {
+        // Only the category range is known → cat rebuilt, val passes through unchanged
+        let mut m = HashMap::new();
+        let (k, v) = strs("Tables!A729:A733", &[Some("a"), None, Some("c"), Some("d"), Some("e")]);
+        m.insert(k, v);
+        let (out, st) = rewrite_chart_cache(labelled_chart().as_bytes(), &m).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!((st.series_updated, st.labels_updated), (0, 1));
+        assert_eq!(pts_in(&s, "cat"), vec![(0, "a".into()), (2, "c".into()), (3, "d".into()), (4, "e".into())],
+            "blank label cell → no point, idx kept");
+        assert!(s.contains(r#"<c:cat><c:strRef><c:f>Tables!$A$729:$A$733</c:f><c:strCache><c:ptCount val="5"/>"#));
+        assert!(s.contains("<c:v>0.24</c:v>"), "values untouched");
+        assert!(s.contains("<c:v>Market  </c:v>"), "series name untouched");
+    }
+
+    #[test]
+    fn test_rewrite_numeric_categories_use_num_cache() {
+        let xml = r#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:lineChart>
+<c:ser><c:cat><c:numRef><c:f>Tables!$A$1:$A$3</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="3"/>
+<c:pt idx="0"><c:v>2022</c:v></c:pt><c:pt idx="1"><c:v>2023</c:v></c:pt><c:pt idx="2"><c:v>2024</c:v></c:pt></c:numCache></c:numRef></c:cat>
+<c:val><c:numRef><c:f>Tables!$B$1:$B$3</c:f><c:numCache><c:ptCount val="3"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val>
+</c:ser></c:lineChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let mut m = vals("Tables!B1:B3", vec![Some(4.0), Some(5.0), Some(6.0)]);
+        m.insert(("Tables!A1:A3".to_string(), RefKind::Num), CacheValues::Num(vec![Some(2023.0), Some(2024.0), Some(2025.0)]));
+        let (out, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!((st.series_updated, st.labels_updated), (1, 1));
+        assert_eq!(pts_in(&s, "cat"), vec![(0, "2023".into()), (1, "2024".into()), (2, "2025".into())]);
+        assert!(s.contains("<c:formatCode>General</c:formatCode>"));
+    }
+
+    #[test]
+    fn test_rewrite_scatter_xval_yval_and_bubble() {
+        let xml = r#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:bubbleChart>
+<c:ser><c:xVal><c:numRef><c:f>Tables!$A$1:$A$2</c:f><c:numCache><c:ptCount val="2"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:xVal>
+<c:yVal><c:numRef><c:f>Tables!$B$1:$B$2</c:f><c:numCache><c:ptCount val="2"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:yVal>
+<c:bubbleSize><c:numRef><c:f>Tables!$C$1:$C$2</c:f><c:numCache><c:ptCount val="2"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:bubbleSize>
+</c:ser></c:bubbleChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let mut m = HashMap::new();
+        for (r, a, b) in [("Tables!A1:A2", 10.0, 11.0), ("Tables!B1:B2", 20.0, 21.0), ("Tables!C1:C2", 30.0, 31.0)] {
+            m.insert((r.to_string(), RefKind::Num), CacheValues::Num(vec![Some(a), Some(b)]));
+        }
+        let (out, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!((st.series_updated, st.labels_updated), (0, 3));
+        assert_eq!(pts_in(&s, "xVal"), vec![(0, "10".into()), (1, "11".into())]);
+        assert_eq!(pts_in(&s, "yVal"), vec![(0, "20".into()), (1, "21".into())]);
+        assert_eq!(pts_in(&s, "bubbleSize"), vec![(0, "30".into()), (1, "31".into())]);
+    }
+
+    #[test]
+    fn test_rewrite_multilevel_categories_left_to_powerpoint() {
+        let xml = r#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:barChart>
+<c:ser><c:cat><c:multiLvlStrRef><c:f>Tables!$A$1:$B$2</c:f><c:multiLvlStrCache><c:ptCount val="2"/>
+<c:lvl><c:pt idx="0"><c:v>x</c:v></c:pt></c:lvl></c:multiLvlStrCache></c:multiLvlStrRef></c:cat>
+<c:val><c:numRef><c:f>Tables!$C$1:$C$2</c:f><c:numCache><c:ptCount val="2"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val>
+</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let m = vals("Tables!C1:C2", vec![Some(7.0), Some(8.0)]);
+        let (out, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(st.needs_com, "multi-level categories need PowerPoint's refresh");
+        assert_eq!(st.series_updated, 1, "values are still rebuilt");
+        assert!(s.contains("<c:lvl><c:pt idx=\"0\"><c:v>x</c:v></c:pt></c:lvl>"), "multi-level cache untouched");
+        let (refs, needs_com) = extract_series_refs_all(xml);
+        assert!(needs_com);
+        assert_eq!(refs, vec![sref(SeriesElem::Val, "Tables!$C$1:$C$2", RefKind::Num)]);
+    }
+
+    #[test]
+    fn test_extract_series_refs_all_kinds_and_labels() {
+        let (refs, needs_com) = extract_series_refs_all(labelled_chart());
+        assert!(!needs_com);
+        assert_eq!(refs, vec![
+            sref(SeriesElem::Tx, "Tables!$L$728", RefKind::Str),
+            sref(SeriesElem::Cat, "Tables!$A$729:$A$733", RefKind::Str),
+            sref(SeriesElem::Val, "Tables!$L$729:$L$733", RefKind::Num),
+        ]);
+        assert_eq!(extract_val_refs(labelled_chart()), vec!["Tables!$L$729:$L$733".to_string()]);
+
+        let labels = extract_cached_labels(labelled_chart());
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].tx_ref.as_deref(), Some("Tables!$L$728"));
+        assert_eq!(labels[0].tx, vec![Some("Market  ".to_string())]);
+        assert_eq!(labels[0].cat_ref.as_deref(), Some("Tables!$A$729:$A$733"));
+        assert_eq!(labels[0].cat, vec![
+            Some("Outdoor Ads".to_string()), Some("In-person: Saw Someone Using".to_string()),
+            Some("Ad / Promotion".to_string()), Some("Tv / Streaming (ads Or Content)".to_string()),
+            Some("E-cigarettes / Vapes (general)".to_string()),
+        ]);
+        assert!(!labels[0].multi_level);
+    }
+
+    #[test]
+    fn test_extract_cached_labels_entities_and_holes() {
+        let xml = r#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:barChart>
+<c:ser><c:cat><c:strRef><c:f>Tables!$A$1:$A$3</c:f><c:strCache><c:ptCount val="3"/>
+<c:pt idx="0"><c:v>R&amp;D</c:v></c:pt><c:pt idx="2"><c:v>c</c:v></c:pt></c:strCache></c:strRef></c:cat>
+<c:val><c:numRef><c:f>Tables!$B$1:$B$3</c:f><c:numCache><c:ptCount val="3"/></c:numCache></c:numRef></c:val>
+</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let labels = extract_cached_labels(xml);
+        assert_eq!(labels[0].cat, vec![Some("R&D".to_string()), None, Some("c".to_string())]);
+        assert!(labels[0].tx.is_empty());
+    }
+
+    #[test]
+    fn test_multi_cell_series_name_is_one_point_per_cell() {
+        // PowerPoint stores `tx` = Tables!$L$1067:$L$1069 as three points, not one joined string
+        let xml = r#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:barChart>
+<c:ser><c:tx><c:strRef><c:f>Tables!$L$1067:$L$1069</c:f><c:strCache><c:ptCount val="3"/>
+<c:pt idx="0"><c:v>2025</c:v></c:pt><c:pt idx="1"><c:v>Gen Pop</c:v></c:pt><c:pt idx="2"><c:v>Market  </c:v></c:pt></c:strCache></c:strRef></c:tx>
+<c:val><c:numRef><c:f>Tables!$L$1070:$L$1071</c:f><c:numCache><c:ptCount val="2"/></c:numCache></c:numRef></c:val>
+</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let labels = extract_cached_labels(xml);
+        assert_eq!(labels[0].tx, vec![Some("2025".to_string()), Some("Gen Pop".to_string()), Some("Market  ".to_string())]);
+
+        let mut m = HashMap::new();
+        let (k, v) = strs("Tables!L1067:L1069", &[Some("2025"), Some("Gen Pop"), Some("France  ")]);
+        m.insert(k, v);
+        let (out, st) = rewrite_chart_cache(xml.as_bytes(), &m).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(st.labels_updated, 1);
+        assert_eq!(pts_in(&s, "tx"), vec![(0, "2025".into()), (1, "Gen Pop".into()), (2, "France  ".into())]);
+        assert!(s.contains(r#"<c:tx><c:strRef><c:f>Tables!$L$1067:$L$1069</c:f><c:strCache><c:ptCount val="3"/>"#));
+    }
+
+    #[test]
+    fn test_roundtrip_labels_rewrite_then_extract() {
+        let mut m = HashMap::new();
+        let (k, v) = strs("Tables!A729:A733", &[Some("Ä & Ö"), Some("b"), None, Some("d"), Some("e")]);
+        m.insert(k, v);
+        let (out, _) = rewrite_chart_cache(labelled_chart().as_bytes(), &m).unwrap();
+        let labels = extract_cached_labels(&String::from_utf8(out).unwrap());
+        assert_eq!(labels[0].cat, vec![Some("Ä & Ö".to_string()), Some("b".to_string()), None, Some("d".to_string()), Some("e".to_string())]);
     }
 
     #[test]

@@ -104,6 +104,19 @@ The `replace` step (`text_replacer.rs`) uses `TextRange.Replace(FindWhat, Replac
 - quick-xml ≥ 0.37 delivers `&amp;`/`&#x2019;` as separate `Event::GeneralRef` events, not inside `Event::Text` — resolve them or the joined text has holes.
 - Match on **char** indices, not byte offsets, so snippets and highlights stay aligned for non-ASCII text; case-insensitive mode folds each char individually to keep indices stable.
 
+### #48 Linked Chart Refresh = EVERY Reference, Not Just Values (Rust-specific)
+PowerPoint's "refresh link" re-reads everything a chart references. `oa update` bypasses that refresh for speed (ZIP cache rewrite + `AutoUpdate=Manual`, #15/#22), so it must rebuild every cache itself. Until v0.3.7 it rebuilt only `<c:val>`; a chart moved from Indonesia to France showed France numbers under Indonesia category labels (`rpm_2025_market_report_wip_template_v1.6`, Chart 11 / Chart 9).
+
+| Element | Cache | Excel read |
+|---|---|---|
+| `c:tx` series name | `strRef/strCache` | display text, one point per cell (a `L1067:L1069` name is 3 points — that is how PowerPoint stores it) |
+| `c:cat` categories | `strRef/strCache` or `numRef/numCache` | display text / numbers |
+| `c:val`, `c:yVal`, `c:bubbleSize` | `numRef/numCache` | `Value2` numbers (#43) |
+| `c:xVal` | either | by ref type |
+| `multiLvlStrRef`, `c15:datalabelsRange` | not rebuilt | chart is refreshed by `LinkFormat.Update()` (still set to manual afterwards) |
+
+Rules: the **ref type in the XML decides the reader** — `strRef` → `office::excel_data::read_range_texts` (`Value2` once; numeric cells such as a `2024` header re-read with `.Text` so formatting is kept), `numRef` → `read_range_numbers`. Blank cells omit the `<c:pt>` in both kinds; `ptCount` stays the cell count. Text is XML-escaped on write and un-escaped on read (quick-xml ≥ 0.37 delivers `&amp;` as a separate `GeneralRef` event). Verified: ZIP-patching only the `<c:cat>` cache made PowerPoint display the new labels with `AutoUpdate=1`, `IsLinked=True`; a full run on the v1.6 deck matches the refresh button. Cost on the 128-chart v0.4 deck: pre-update 0.5 s → 0.7 s (274 label ranges). `oa check` compares categories and series names too (`labels differ`), so a stale label can no longer pass.
+
 ## Table Operations
 
 ### #7 Float Precision in Contrast Color
@@ -120,8 +133,8 @@ Charts in PPTX XML don't use flat indexing. Map charts to their slide and positi
 ### #20 Non-Contiguous Chart Ranges
 Chart data ranges can be non-contiguous (comma-separated in the formula). Split on commas and read each range part separately.
 
-### #23 Chart XML: Filter to val/ Only
-When collecting `numRef` elements from chart XML, only collect those inside `<c:val>` elements (value axis). Ignore those in `<c:cat>` (category axis) to avoid double-counting.
+### #23 Chart XML: Keep Each Reference's Element and Kind (was "val only")
+Originally: "only collect `numRef` inside `<c:val>`, ignore `<c:cat>`" — written to avoid double-counting a category range shared by every series. That rule silently became "categories are never refreshed" and left stale labels (see #48). Now every series reference is collected **with its element and kind** (`SeriesRef { elem, formula, kind }`); shared ranges are de-duplicated by `(normalised range, kind)` in `collect_unique_ranges`, so a category range used by five series is still read once. Callers that need "one value range per series" use `extract_val_refs`.
 
 ### #24 Unlinked Charts in XML
 Filter `.rels` entries to external references only. Internal chart data (embedded) should not be treated as linked charts.

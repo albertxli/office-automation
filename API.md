@@ -81,7 +81,7 @@ oa update <FILES...> [OPTIONS]
 | Operation | Description |
 |-----------|-------------|
 | ZIP pre-relink | Rewrite OLE/chart paths in PPTX XML (0.1s vs 100s via COM) |
-| ZIP chart pre-update | Rewrite chart numCache values directly in XML |
+| ZIP chart pre-update | Rewrite every chart cache directly in XML: values, category labels, series names, scatter/bubble data (parity with PowerPoint's refresh; links stay manual). Charts with multi-level categories or cell-driven data labels are refreshed by PowerPoint instead |
 
 **Examples:**
 
@@ -271,7 +271,7 @@ oa check <FILE> [OPTIONS]
 - **Transposed tables**: Handles row/col swap correctly
 - **_ccst tables**: Applies the same transform (prefix, symbol removal) before comparing
 - **Deltas**: Verifies shape sign suffix (_pos/_neg/_none) matches Excel value
-- **Charts**: Link targets, series counts, series values (cached vs Excel)
+- **Charts**: Link targets, series counts, series values, category labels and series names (cached vs Excel)
 
 **Examples:**
 
